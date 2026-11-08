@@ -1,0 +1,18 @@
+services:
+  cluster:
+    build: ./mvp
+    image: ai-cluster:local
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./mvp/.env
+    environment:
+      DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: "8000"
+    volumes:
+      - cluster-data:/data
+    restart: unless-stopped
+
+volumes:
+  cluster-data:

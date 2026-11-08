@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+mvp/data/
+mvp/.env
+test_result.json
