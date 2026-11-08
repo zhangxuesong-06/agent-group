@@ -1,6 +1,49 @@
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
-mvp/data/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!**/.env.example
 mvp/.env
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local runtime data
+mvp/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
 test_result.json
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
