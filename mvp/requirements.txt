@@ -4,3 +4,4 @@ httpx>=0.28
 pydantic>=2.7
 python-dotenv>=1.0
 mcp>=2.0
+websockets>=13.0

@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     steps        INTEGER NOT NULL DEFAULT 0,
     tokens       INTEGER NOT NULL DEFAULT 0,
     started_at   REAL,
-    finished_at  REAL
+    finished_at  REAL,
+    checkpoint   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id, ord);
 
@@ -68,6 +69,17 @@ CREATE TABLE IF NOT EXISTS events (
     payload   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+
+CREATE TABLE IF NOT EXISTS devices (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL UNIQUE,
+    platform    TEXT NOT NULL DEFAULT '',
+    workspaces  TEXT NOT NULL DEFAULT '[]',
+    created_at  REAL NOT NULL,
+    last_seen   REAL NOT NULL DEFAULT 0,
+    enabled     INTEGER NOT NULL DEFAULT 1
+);
 
 CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
@@ -209,6 +221,7 @@ class Store:
             ("model_id", "TEXT"),
             ("model_name", "TEXT"),
             ("round", "INTEGER NOT NULL DEFAULT 1"),
+            ("checkpoint", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in task_columns:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
@@ -280,7 +293,9 @@ class Store:
             )
             self._conn.commit()
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_run(
+        self, run_id: str, *, include_checkpoint: bool = False
+    ) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if row is None:
@@ -292,7 +307,10 @@ class Store:
         data["budget"] = json.loads(data["budget"])
         data["usage"] = json.loads(data["usage"])
         data["cluster"] = json.loads(data.get("cluster") or "{}")
-        data["tasks"] = [self._task_row(t) for t in tasks]
+        data["tasks"] = [
+            self._task_row(t, include_checkpoint=include_checkpoint)
+            for t in tasks
+        ]
         data["progress"] = self._progress(data["tasks"])
         data["messages"] = self.list_messages(run_id)
         return data
@@ -384,7 +402,7 @@ class Store:
         return data
 
     def load_run_state(self, run_id: str) -> RunState | None:
-        data = self.get_run(run_id)
+        data = self.get_run(run_id, include_checkpoint=True)
         if data is None:
             return None
         usage = data.get("usage") or {}
@@ -426,6 +444,7 @@ class Store:
                     tokens=int(item.get("tokens") or 0),
                     started_at=item.get("started_at"),
                     finished_at=item.get("finished_at"),
+                    checkpoint=item.get("checkpoint"),
                 )
             )
         return run
@@ -450,6 +469,112 @@ class Store:
             item["task_counts"] = by_run.get(item["id"], {})
             out.append(item)
         return out
+
+    # ---------- devices ----------
+
+    def create_device(
+        self, name: str, token_hash: str, *, platform: str = ""
+    ) -> dict[str, Any]:
+        device = {
+            "id": new_id("dev"),
+            "name": name.strip()[:80] or "device",
+            "token_hash": token_hash,
+            "platform": platform[:120],
+            "workspaces": [],
+            "created_at": time.time(),
+            "last_seen": 0.0,
+            "enabled": 1,
+        }
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO devices (id, name, token_hash, platform, workspaces, created_at, last_seen, enabled)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    device["id"],
+                    device["name"],
+                    device["token_hash"],
+                    device["platform"],
+                    "[]",
+                    device["created_at"],
+                    device["last_seen"],
+                    device["enabled"],
+                ),
+            )
+            self._conn.commit()
+        return device
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM devices ORDER BY created_at"
+            ).fetchall()
+        return [self._device_row(row) for row in rows]
+
+    def get_device(self, device_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM devices WHERE id=?", (device_id,)
+            ).fetchone()
+        return self._device_row(row) if row else None
+
+    def get_device_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM devices WHERE token_hash=? AND enabled=1",
+                (token_hash,),
+            ).fetchone()
+        return self._device_row(row) if row else None
+
+    def update_device(
+        self,
+        device_id: str,
+        *,
+        name: str | None = None,
+        platform: str | None = None,
+        workspaces: list[str] | None = None,
+        last_seen: float | None = None,
+    ) -> dict[str, Any] | None:
+        sets: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            sets.append("name=?")
+            values.append(name[:80])
+        if platform is not None:
+            sets.append("platform=?")
+            values.append(platform[:120])
+        if workspaces is not None:
+            sets.append("workspaces=?")
+            values.append(json.dumps(workspaces[:32], ensure_ascii=False))
+        if last_seen is not None:
+            sets.append("last_seen=?")
+            values.append(last_seen)
+        if not sets:
+            return self.get_device(device_id)
+        values.append(device_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE devices SET {', '.join(sets)} WHERE id=?", values
+            )
+            self._conn.commit()
+        return self.get_device(device_id)
+
+    def delete_device(self, device_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM devices WHERE id=?", (device_id,)
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _device_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            item["workspaces"] = json.loads(item.get("workspaces") or "[]")
+        except json.JSONDecodeError:
+            item["workspaces"] = []
+        item.pop("token_hash", None)
+        return item
 
     # ---------- clusters ----------
 
@@ -537,8 +662,8 @@ class Store:
         with self._lock:
             self._conn.executemany(
                 "INSERT INTO tasks (id, run_id, ord, title, instruction, capability, round, depends_on, status,"
-                " assignee, model_id, model_name, result, error, attempts, steps, tokens, started_at, finished_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " assignee, model_id, model_name, result, error, attempts, steps, tokens, started_at, finished_at, checkpoint)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         t.id,
@@ -560,6 +685,9 @@ class Store:
                         t.tokens,
                         t.started_at,
                         t.finished_at,
+                        json.dumps(t.checkpoint, ensure_ascii=False)
+                        if t.checkpoint
+                        else "",
                     )
                     for t in tasks
                 ],
@@ -570,7 +698,7 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "UPDATE tasks SET status=?, assignee=?, model_id=?, model_name=?, result=?, error=?,"
-                " attempts=?, steps=?, tokens=?, started_at=?, finished_at=? WHERE id=?",
+                " attempts=?, steps=?, tokens=?, started_at=?, finished_at=?, checkpoint=? WHERE id=?",
                 (
                     task.status,
                     task.assignee,
@@ -583,6 +711,9 @@ class Store:
                     task.tokens,
                     task.started_at,
                     task.finished_at,
+                    json.dumps(task.checkpoint, ensure_ascii=False)
+                    if task.checkpoint
+                    else "",
                     task.id,
                 ),
             )
@@ -1003,9 +1134,22 @@ class Store:
         )
 
     @staticmethod
-    def _task_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _task_row(
+        row: sqlite3.Row, *, include_checkpoint: bool = False
+    ) -> dict[str, Any]:
         item = dict(row)
         item["depends_on"] = json.loads(item["depends_on"])
+        if include_checkpoint:
+            raw = item.get("checkpoint") or ""
+            if raw:
+                try:
+                    item["checkpoint"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["checkpoint"] = None
+            else:
+                item["checkpoint"] = None
+        else:
+            item.pop("checkpoint", None)
         return item
 
     @staticmethod

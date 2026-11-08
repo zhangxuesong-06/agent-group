@@ -216,6 +216,14 @@ Azure OpenAI 可用自定义供应商：Base URL 填
 - 下载运行产物（`artifacts` 区域）
 - 左侧「任务」和内页的任务/事件流都可以收起，状态会记住
 
+### 服务重启与断点恢复
+
+- 每个 Agent 在完成一批工具调用后，会把消息、工具观察结果和下一步编号写入 `tasks.checkpoint`
+- 服务启动时会扫描 `planning` / `running` 的运行，把 `running` / `ready` 任务重置为 `pending`，再从检查点继续
+- 已完成的任务和工具步骤不会重跑；崩溃瞬间正在执行的工具可能重跑一次（at-least-once），因此写文件/命令类工具要能接受重复执行
+- 正常停止服务时会保留运行状态，下次启动自动恢复，不会把可恢复的运行误标成 `cancelled`
+- 启动日志会打印 `[recover] resumed ...`，事件流里也会出现「服务重启，已从检查点恢复」
+
 ### 集群预设与单模型模式
 
 左侧边栏顶部可以选择本次任务使用的集群：
@@ -383,10 +391,15 @@ LLM_MODEL=gpt-4o-mini
 - 局域网：直接用启动时打印的 `http://局域网IP:8000`
 - 跨网络个人使用：推荐 Tailscale，无需公网 IP 和端口映射
 - 公网 HTTPS：Cloudflare Tunnel，务必同时设置 `ACCESS_TOKEN`
-- 7×24 云端：`docker compose up -d --build`（已提供 `Dockerfile` 和 `docker-compose.yml`）
+- 7×24 云端：`docker compose --env-file deploy/.env.cloud -f docker-compose.cloud.yml up -d --build`（Caddy 自动 HTTPS）
+- **云端 + 远程工作区**：在每台电脑上运行 `mvp.worker.agent`，设备主动外连服务器；网页里选择在线设备和工作区后，文件/命令工具会在该设备执行
+  - 服务器只暴露 80/443
+  - 每台设备一个独立 token，按 workspace 根目录授权
+  - 设备离线时不能创建新任务；运行中掉线会报工具错误，重新上线后可继续
 
-完整对比、安全清单、云端规格和限制评估见
-[`docs/远程访问与部署.md`](docs/远程访问与部署.md)。
+完整步骤、配对命令、安全清单和限制见
+[`docs/cloud-deployment.md`](docs/cloud-deployment.md)。
+旧的局域网/隧道方案见 [`docs/远程访问与部署.md`](docs/远程访问与部署.md)。
 
 ---
 
@@ -396,24 +409,30 @@ LLM_MODEL=gpt-4o-mini
 集群/
 ├─ docs/
 │  ├─ 架构设计.md          # 组件、协议、可靠性、路线图、踩坑清单
-│  └─ 远程访问与部署.md     # 局域网 / Tailscale / 隧道 / VPS / 可行性评估
+│  ├─ 远程访问与部署.md     # 局域网 / Tailscale / 隧道 / VPS / 可行性评估
+│  └─ cloud-deployment.md  # 云端 + 远程设备工作区（WebSocket worker）
 ├─ mvp/
 │  ├─ app/
-│  │  ├─ main.py           # FastAPI：REST + SSE + 鉴权 + 静态页面
-│  │  ├─ orchestrator.py   # 规划 / 调度 / 状态机 / 预算
+│  │  ├─ main.py           # FastAPI：REST + SSE + 鉴权 + 静态页面 + worker WS
+│  │  ├─ orchestrator.py   # 规划 / 调度 / 状态机 / 预算 / 断点恢复
 │  │  ├─ agents.py         # Agent 注册表 + 能力路由
-│  │  ├─ tools.py          # 工具注册表（calc / 检索 / 抓取 / 产物）
+│  │  ├─ tools.py          # 工具注册表（calc / 检索 / 抓取 / 产物 / 远程路由）
+│  │  ├─ devices.py        # 设备注册、在线连接、远程工作区适配
 │  │  ├─ llm.py            # OpenAI 兼容客户端 + mock 实现
 │  │  ├─ providers.py      # 供应商预设、Key 掩码、连接测试
 │  │  ├─ routing.py        # 多模型领域评分与路由
 │  │  ├─ evaluation.py     # 实测评分套件、模型档案、任务
 │  │  ├─ bus.py            # 事件总线（进程内，可换 Redis Streams）
-│  │  ├─ store.py          # SQLite：Run / Task / Event
+│  │  ├─ store.py          # SQLite：Run / Task / Event / Device
 │  │  └─ models.py         # 领域模型
+│  ├─ worker/agent.py      # 设备端 worker：外连服务器，执行工作区工具
 │  ├─ static/index.html    # 单页控制台（任务 DAG / 实时日志 / 交付物）
+│  ├─ scripts/pair_device.py  # 生成设备 token 与启动命令
 │  ├─ scripts/smoke.py     # 端到端冒烟测试
 │  ├─ Dockerfile
 │  └─ requirements.txt
+├─ deploy/                 # Caddyfile + 云端环境变量样例
+├─ docker-compose.cloud.yml
 ├─ start.cmd / start.sh
 ├─ docker-compose.yml
 └─ README.md

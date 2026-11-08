@@ -77,6 +77,11 @@ class Settings:
 
     max_concurrency: int = field(default_factory=lambda: _env_int("MAX_CONCURRENCY", 4))
     max_steps_per_task: int = field(default_factory=lambda: _env_int("MAX_STEPS_PER_TASK", 10))
+    # Derive a compressed prompt view once a task's conversation grows past
+    # this size. The raw transcript stays in SQLite for replay/audit.
+    context_compact_tokens: int = field(
+        default_factory=lambda: _env_int("CONTEXT_COMPACT_TOKENS", 40000)
+    )
     max_total_steps: int = field(default_factory=lambda: _env_int("MAX_TOTAL_STEPS", 60))
     max_tokens: int = field(default_factory=lambda: _env_int("MAX_TOKENS", 2_000_000))
     max_usd: float = field(default_factory=lambda: _env_float("MAX_USD", 1.0))

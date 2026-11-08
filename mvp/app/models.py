@@ -32,6 +32,12 @@ class CreateRunRequest(BaseModel):
     budget: Budget | None = None
     cluster_id: str | None = Field(default=None, max_length=80)
     cluster_mode: bool = True
+    device_id: str | None = Field(default=None, max_length=80)
+    workspace: str | None = Field(default=None, max_length=1000)
+
+
+class DeviceInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
 
 
 class ClusterInput(BaseModel):
@@ -186,6 +192,9 @@ class TaskState:
     tokens: int = 0
     started_at: float | None = None
     finished_at: float | None = None
+    # Durable step checkpoint: messages, tool observations and next step.
+    # Kept in SQLite so a restarted process can continue an in-flight task.
+    checkpoint: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -229,3 +238,6 @@ class RunState:
     deadline_at: float = 0.0
     cancelled: bool = False
     cluster: dict[str, Any] = field(default_factory=dict)
+    # Set while the process is shutting down; cancellation must not turn a
+    # resumable run into a terminal one.
+    shutting_down: bool = False

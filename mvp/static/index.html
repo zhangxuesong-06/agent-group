@@ -318,6 +318,13 @@
     gap: 12px; color: var(--muted); font-size: 10.5px;
   }
   .composer-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 8px; }
+  .device-select {
+    max-width: 230px; padding: 4px 8px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel);
+    color: var(--muted); font-size: 11px; outline: none;
+  }
+  .device-select:focus { border-color: var(--accent); }
+  .device-select.offline { color: var(--bad); border-color: rgba(251,113,133,.35); }
   .field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
   .field input {
     width: 76px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
@@ -1212,6 +1219,8 @@
         <div class="composer-topline">
           <span class="cluster-chip" id="composerCluster">全部模型</span>
           <label class="mode-toggle"><input id="clusterMode" type="checkbox" checked /> 集群模式</label>
+          <select class="device-select" id="deviceSelect" title="任务在哪个设备的工作区执行"></select>
+          <select class="device-select" id="workspaceSelect" title="设备授权的工作区" hidden></select>
           <span class="hint-inline" id="clusterModeHint"></span>
         </div>
         <div class="composer-actions">
@@ -1245,11 +1254,13 @@ const state = {
   batchId: null, batchRunning: false,
   activeRuns: 0,
   runs: [], runMeta: new Map(), messages: [],
-  quote: null, chatStream: null,
+  quote: null, chatStream: null, pendingUser: [],
   thinkingOpen: true, thinkKey: null, thinkText: "",
   resultStream: "", resultStreamActive: false,
   titleTimer: null, baseTitle: document.title, audioCtx: null,
   clusters: [], defaultClusterId: null,
+  devices: [], deviceId: localStorage.getItem("ai_device_id") || "",
+  workspace: localStorage.getItem("ai_workspace") || "",
   clusterId: localStorage.getItem("ai_cluster_id") || "",
   clusterMode: localStorage.getItem("ai_cluster_mode") !== "0",
   modelView: localStorage.getItem("ai_model_view") || "supplier",
@@ -1372,8 +1383,12 @@ function renderHeader() {
   const cluster = r.cluster || {};
   if (cluster.name) {
     const count = (cluster.provider_ids || []).length;
+    const device = cluster.device || null;
+    const deviceText = device
+      ? ` · ${device.name || device.id}${device.workspace ? ":" + device.workspace : ""}`
+      : " · 服务器本机";
     $("runCluster").textContent =
-      `${cluster.name} · ${count || 0} 个模型 · ${cluster.single_model ? "单模型模式" : "集群模式"}`;
+      `${cluster.name} · ${count || 0} 个模型 · ${cluster.single_model ? "单模型模式" : "集群模式"}${deviceText}`;
   } else {
     $("runCluster").textContent = "";
   }
@@ -1684,7 +1699,32 @@ function chatHeaders() {
   return headers;
 }
 
+function addPendingUser(content) {
+  const id = "tmp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+  state.pendingUser.push({ id, content });
+  state.messages.push({
+    id,
+    run_id: state.runId,
+    role: "user",
+    kind: "chat",
+    content,
+    meta: {},
+    ts: Date.now() / 1000,
+  });
+  renderMessagesUI();
+  scrollThread(true);
+}
+
+function removePendingUser(content) {
+  const index = state.pendingUser.findIndex((item) => item.content === content);
+  if (index < 0) return;
+  const [item] = state.pendingUser.splice(index, 1);
+  state.messages = state.messages.filter((message) => message.id !== item.id);
+  renderMessagesUI();
+}
+
 async function sendChat(content) {
+  addPendingUser(content);
   try {
     const response = await fetch(`/api/runs/${state.runId}/messages`, {
       method: "POST",
@@ -1692,6 +1732,7 @@ async function sendChat(content) {
       body: JSON.stringify({ content }),
     });
     if (response.status === 401) {
+      removePendingUser(content);
       showTokenModal("令牌不正确，请重试");
       return;
     }
@@ -1717,6 +1758,9 @@ async function sendChat(content) {
     }
   } catch (err) {
     toast("对话失败：" + err.message);
+  } finally {
+    // If the server never echoed the user message, drop the optimistic copy.
+    removePendingUser(content);
   }
 }
 
@@ -1740,7 +1784,19 @@ function handleChatEvent(event) {
     return;
   }
   if (event.type === "user") {
-    state.messages.push(event.message);
+    const index = state.pendingUser.findIndex(
+      (item) => item.content.trim() === event.message.content.trim()
+    );
+    if (index >= 0) {
+      const [pending] = state.pendingUser.splice(index, 1);
+      const existing = state.messages.findIndex(
+        (message) => message.id === pending.id
+      );
+      if (existing >= 0) state.messages[existing] = event.message;
+      else state.messages.push(event.message);
+    } else {
+      state.messages.push(event.message);
+    }
     renderMessagesUI();
     scrollThread(true);
     return;
@@ -2118,6 +2174,9 @@ function handleEvent(e) {
       if (state.run) { state.run.status = p.status; renderHeader(); }
       appendLog("run", "RUN", `状态 → ${statusLabel(p.status)}`);
       break;
+    case "run.recovered":
+      appendLog("run", "RECOVER", p.message || "服务重启，已从检查点恢复");
+      refreshRun(); break;
     case "round.started":
       appendLog(
         "run",
@@ -2213,6 +2272,13 @@ function handleEvent(e) {
         "",
         "GUIDE",
         `${p.title || "任务"} 收到引导：${(p.notes || []).join("；")}`
+      );
+      break;
+    case "context.compacted":
+      appendLog(
+        "run",
+        "COMPACT",
+        `${p.task || "任务"} 上下文已压缩：${p.tokens_before || "?"} → ${p.tokens_after || "?"} tokens`
       );
       break;
     case "front.guided":
@@ -2934,6 +3000,64 @@ function renderClusterSelect() {
       .join("");
   select.value = state.clusterId || "";
   updateClusterUI();
+}
+
+async function loadDevices() {
+  try {
+    const data = await api("/api/devices");
+    state.devices = data.devices || [];
+  } catch (err) {
+    state.devices = [];
+  }
+  const current = state.devices.find((device) => device.id === state.deviceId);
+  if (state.deviceId && !current) {
+    state.deviceId = "";
+    state.workspace = "";
+    localStorage.setItem("ai_device_id", "");
+    localStorage.setItem("ai_workspace", "");
+  }
+  if (current) {
+    const roots = current.workspaces || [];
+    if (!roots.includes(state.workspace)) state.workspace = roots[0] || "";
+  }
+  renderDeviceSelect();
+}
+
+function selectedDevice() {
+  return state.devices.find((device) => device.id === state.deviceId) || null;
+}
+
+function renderDeviceSelect() {
+  const select = $("deviceSelect");
+  if (!select) return;
+  select.innerHTML =
+    `<option value="">服务器本机</option>` +
+    state.devices
+      .map(
+        (device) =>
+          `<option value="${esc(device.id)}">${esc(device.name)}${
+            device.online ? "" : "（离线）"
+          }</option>`
+      )
+      .join("");
+  select.value = state.deviceId || "";
+  const device = selectedDevice();
+  select.classList.toggle("offline", !!device && !device.online);
+
+  const workspaceSelect = $("workspaceSelect");
+  const roots = device ? device.workspaces || [] : [];
+  if (!device || roots.length <= 1) {
+    workspaceSelect.hidden = true;
+    workspaceSelect.innerHTML = "";
+    if (device && roots.length === 1) state.workspace = roots[0];
+    return;
+  }
+  workspaceSelect.hidden = false;
+  workspaceSelect.innerHTML = roots
+    .map((root) => `<option value="${esc(root)}">${esc(root)}</option>`)
+    .join("");
+  if (!roots.includes(state.workspace)) state.workspace = roots[0];
+  workspaceSelect.value = state.workspace;
 }
 
 function updateClusterUI() {
@@ -4010,6 +4134,8 @@ async function submit() {
         budget,
         cluster_id: state.clusterId || null,
         cluster_mode: clusterMode,
+        device_id: state.deviceId || null,
+        workspace: state.deviceId ? state.workspace || null : null,
       }),
     });
     state.runId = run_id; state.tasks = []; state.logCount = 0; state.messages = [];
@@ -4286,6 +4412,17 @@ function bindUI() {
     if (btn) resumeRun(btn.dataset.retryTask);
   };
   $("deleteRunBtn").onclick = deleteCurrentRun;
+  $("deviceSelect").onchange = (e) => {
+    state.deviceId = e.target.value;
+    state.workspace = "";
+    localStorage.setItem("ai_device_id", state.deviceId);
+    localStorage.setItem("ai_workspace", "");
+    renderDeviceSelect();
+  };
+  $("workspaceSelect").onchange = (e) => {
+    state.workspace = e.target.value;
+    localStorage.setItem("ai_workspace", state.workspace);
+  };
   $("clusterSelect").onchange = (e) => {
     state.clusterId = e.target.value;
     localStorage.setItem("ai_cluster_id", state.clusterId);
@@ -4450,11 +4587,13 @@ async function init() {
   $("thinkingPanel").classList.toggle("collapsed", !state.thinkingOpen);
   renderToolbars();
   await loadMetaAndRuns();
+  await loadDevices();
   pollApprovals();
   setInterval(pollApprovals, 2000);
   setInterval(() => {
     if (state.activeRuns > 0) loadRuns().catch(() => {});
   }, 10000);
+  setInterval(() => loadDevices().catch(() => {}), 15000);
 }
 init();
 </script>

@@ -5,14 +5,15 @@ import json
 import time
 import re
 from collections import Counter
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import tools as tool_registry
 from .agents import AgentRegistry
 from .approvals import ApprovalManager
 from .bus import EventBus
 from .config import Settings
-from .llm import LLMClient, LLMError
+from .devices import DeviceHub, RemoteWorkspace
+from .llm import LLMClient, LLMError, estimate_tokens
 from .mcp import MCPManager
 from .models import (
     AgentSpec,
@@ -108,6 +109,7 @@ class Orchestrator:
         router: ModelRouter | None = None,
         approvals: ApprovalManager | None = None,
         mcp: MCPManager | None = None,
+        devices: DeviceHub | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
@@ -117,6 +119,7 @@ class Orchestrator:
         self.router = router or ModelRouter(store)
         self.approvals = approvals
         self.mcp = mcp
+        self.devices = devices or DeviceHub()
         self._runs: dict[str, RunState] = {}
         self._bg: set[asyncio.Task[Any]] = set()
         self._running_tasks: dict[str, set[asyncio.Task[Any]]] = {}
@@ -135,6 +138,7 @@ class Orchestrator:
         goal: str,
         budget: Budget | None = None,
         cluster: dict[str, Any] | None = None,
+        device: dict[str, Any] | None = None,
     ) -> str:
         budget = budget or Budget(
             max_steps=self.settings.max_total_steps,
@@ -142,13 +146,20 @@ class Orchestrator:
             max_usd=self.settings.max_usd,
             deadline_sec=self.settings.deadline_sec,
         )
+        cluster_data = dict(cluster or {})
+        if device:
+            cluster_data["device"] = {
+                "id": device.get("id", ""),
+                "name": device.get("name", ""),
+                "workspace": device.get("workspace", ""),
+            }
         run = RunState(
             id=new_id("run"),
             goal=goal.strip(),
             status="planning",
             budget=budget,
             deadline_at=now() + budget.deadline_sec,
-            cluster=cluster or {},
+            cluster=cluster_data,
         )
         self._runs[run.id] = run
         self.store.create_run(run)
@@ -222,13 +233,68 @@ class Orchestrator:
         yield self._sse({"type": "user", "message": user_message})
         yield self._sse({"type": "status", "text": "主理人正在判断这一轮怎么做…"})
 
-        decision = await self._lead_decision(run_data, content)
+        # The lead call streams its visible reply while it decides. This is
+        # what makes simple answers feel live instead of waiting for the whole
+        # tool-call decision first.
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        streamed: list[str] = []
+
+        async def lead_delta(text: str, kind: str = "content") -> None:
+            if text and kind == "content":
+                await queue.put(("delta", text))
+
+        async def lead_worker() -> None:
+            try:
+                result = await self._lead_decision(
+                    run_data, content, on_delta=lead_delta
+                )
+                await queue.put(("done", result))
+            except Exception as exc:  # noqa: BLE001 - report to the stream
+                await queue.put(("error", exc))
+
+        lead_task = asyncio.create_task(lead_worker())
+        ack_id = new_id("msg")
+        ack_started = False
+        decision: dict[str, Any] | None = None
+        try:
+            while True:
+                kind, value = await queue.get()
+                if kind == "delta":
+                    streamed.append(value)
+                    if not ack_started:
+                        yield self._sse(
+                            {"type": "start", "message_id": ack_id}
+                        )
+                        ack_started = True
+                    yield self._sse(
+                        {
+                            "type": "delta",
+                            "message_id": ack_id,
+                            "text": value,
+                            "kind": "content",
+                        }
+                    )
+                elif kind == "done":
+                    decision = value
+                    break
+                elif kind == "error":
+                    yield self._sse(
+                        {"type": "error", "error": f"{type(value).__name__}: {value}"}
+                    )
+                    return
+        finally:
+            if not lead_task.done():
+                lead_task.cancel()
+
+        if decision is None:
+            return
         # The decision call can take a while; another round may have started
         # meanwhile, so re-read the authoritative state before dispatching.
         fresh = self.store.get_run(run_id)
         if fresh is not None:
             run_data = fresh
-        reply = decision["reply"] or "我在。"
+        reply = "".join(streamed).strip() or decision["reply"] or "我在。"
+        decision["reply"] = reply
         action = decision["action"]
         planned = decision["tasks"]
         guides = decision["guides"]
@@ -246,7 +312,18 @@ class Orchestrator:
             )
             if note:
                 self.add_guidance(run_id, note)
-                reply = reply.rstrip() + "\n\n已把新的调整要求转达给正在执行的成员。"
+                extra = "\n\n已把新的调整要求转达给正在执行的成员。"
+                reply = reply.rstrip() + extra
+                decision["reply"] = reply
+                if ack_started:
+                    yield self._sse(
+                        {
+                            "type": "delta",
+                            "message_id": ack_id,
+                            "text": extra,
+                            "kind": "content",
+                        }
+                    )
                 await self.bus.publish(
                     run_id,
                     "front.guided",
@@ -276,18 +353,19 @@ class Orchestrator:
             ]
             action = "team" if planned else "reply"
 
-        # 1) Stream the lead's visible acknowledgement.
-        ack_id = new_id("msg")
-        yield self._sse({"type": "start", "message_id": ack_id})
-        for index in range(0, len(reply), 24):
-            yield self._sse(
-                {
-                    "type": "delta",
-                    "message_id": ack_id,
-                    "text": reply[index : index + 24],
-                    "kind": "content",
-                }
-            )
+        # If the model produced no visible content before its tool call, send
+        # the reply from the tool arguments now.
+        if not ack_started:
+            yield self._sse({"type": "start", "message_id": ack_id})
+            for index in range(0, len(reply), 24):
+                yield self._sse(
+                    {
+                        "type": "delta",
+                        "message_id": ack_id,
+                        "text": reply[index : index + 24],
+                        "kind": "content",
+                    }
+                )
         ack = self.store.add_message(
             run_id, "assistant", reply, kind="chat", message_id=ack_id
         )
@@ -394,7 +472,10 @@ class Orchestrator:
             raise
 
     async def _lead_decision(
-        self, run_data: dict[str, Any], content: str
+        self,
+        run_data: dict[str, Any],
+        content: str,
+        on_delta: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         provider_id = self._front_provider_id(run_data)
         capabilities: dict[str, str] = {}
@@ -455,6 +536,7 @@ class Orchestrator:
                 [{"role": "user", "content": prompt}],
                 self._expert_tool_schema(),
                 provider_id=provider_id,
+                on_delta=on_delta,
             )
         except Exception as exc:  # noqa: BLE001 - lead failure is user-visible
             return {
@@ -774,7 +856,7 @@ class Orchestrator:
             )
 
         async def emit(text: str, kind: str = "content") -> None:
-            if text:
+            if text and kind == "content":
                 await queue.put(("delta", text))
 
         try:
@@ -879,6 +961,94 @@ class Orchestrator:
         if not jobs:
             self._running_tasks.pop(run_id, None)
 
+    async def recover_interrupted_runs(self) -> list[str]:
+        """Resume runs that were active when the previous process stopped.
+
+        Completed tasks stay done. In-flight tasks are put back to pending and
+        continue from their step checkpoint, so a restart does not throw away
+        the whole run.
+        """
+        recovered: list[str] = []
+        for item in self.store.list_runs(limit=200):
+            if item.get("status") not in ("planning", "running", "cancelling"):
+                continue
+            run = self.store.load_run_state(item["id"])
+            if run is None:
+                continue
+
+            if run.status == "cancelling":
+                run.status = "cancelled"
+                run.error = "服务重启时已取消"
+                for task in run.tasks:
+                    if task.status not in ("done", "failed"):
+                        task.status = "skipped"
+                        task.error = "服务重启时已取消"
+                        task.finished_at = now()
+                        self.store.update_task(task)
+                self.store.update_run(run)
+                await self.bus.publish(
+                    run.id, "run.cancelled", {"reason": run.error}
+                )
+                continue
+
+            run.error = ""
+            run.cancelled = False
+            # A restart can happen hours later; give the recovered run a fresh
+            # deadline instead of failing immediately on the old one.
+            run.deadline_at = now() + run.budget.deadline_sec
+            reset = 0
+            for task in run.tasks:
+                if task.status in ("ready", "running"):
+                    task.status = "pending"
+                    task.error = ""
+                    task.started_at = None
+                    task.finished_at = None
+                    self.store.update_task(task)
+                    reset += 1
+
+            self._runs[run.id] = run
+            if not run.tasks:
+                run.status = "planning"
+                self.store.update_run(run)
+                job = asyncio.create_task(self._drive(run))
+            else:
+                run.status = "running"
+                self.store.update_run(run)
+                job = asyncio.create_task(self._continue_run(run))
+            self._run_tasks[run.id] = job
+            self._bg.add(job)
+            job.add_done_callback(
+                lambda done, rid=run.id: self._forget_run_task(rid, done)
+            )
+            job.add_done_callback(self._bg.discard)
+            await self.bus.publish(
+                run.id,
+                "run.recovered",
+                {
+                    "tasks": len(run.tasks),
+                    "reset": reset,
+                    "message": "服务重启，已从检查点恢复",
+                },
+            )
+            recovered.append(run.id)
+        return recovered
+
+    async def shutdown(self) -> None:
+        """Stop in-flight work without turning resumable runs into cancelled."""
+        runs = list(self._runs.values())
+        for run in runs:
+            run.shutting_down = True
+        jobs: set[asyncio.Task[Any]] = set()
+        jobs.update(self._run_tasks.values())
+        for children in self._running_tasks.values():
+            jobs.update(children)
+        jobs.update(self._bg)
+        for job in jobs:
+            if not job.done():
+                job.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+
     def is_active(self, run_id: str) -> bool:
         return run_id in self._runs and self._runs[run_id].status in (
             "planning",
@@ -922,6 +1092,7 @@ class Orchestrator:
             task.tokens = 0
             task.started_at = None
             task.finished_at = None
+            task.checkpoint = None
             self.store.update_task(task)
 
         done_tasks = [t for t in run.tasks if t.status == "done"]
@@ -954,16 +1125,26 @@ class Orchestrator:
             run.status = "running"
             self.store.update_run(run)
             await self.bus.publish(run.id, "run.status", {"status": "running"})
-            if run.cluster.get("single_model"):
-                await self._execute_direct(run, run.tasks[0])
+            if run.cluster.get("single_model") and run.tasks:
+                task = run.tasks[0]
+                if task.status in ("pending", "ready"):
+                    await self._execute_direct(run, task)
+                else:
+                    await self._finish(run)
             else:
                 await self._schedule(run)
                 await self._finish(run)
         except asyncio.CancelledError:
-            run.status = "cancelled"
-            run.error = run.error or "运行被中断"
-            self._mark_pending_skipped(run, "运行已停止")
-            await self.bus.publish(run.id, "run.cancelled", {"reason": run.error})
+            if run.shutting_down:
+                run.status = "running"
+                run.error = ""
+            else:
+                run.status = "cancelled"
+                run.error = run.error or "运行被中断"
+                self._mark_pending_skipped(run, "运行已停止")
+                await self.bus.publish(
+                    run.id, "run.cancelled", {"reason": run.error}
+                )
             raise
         except Exception as exc:  # noqa: BLE001 - top-level guard
             run.status = "failed"
@@ -1029,10 +1210,16 @@ class Orchestrator:
                 await self._schedule(run)
                 await self._finish(run)
         except asyncio.CancelledError:
-            run.status = "cancelled"
-            run.error = run.error or "运行被中断"
-            self._mark_pending_skipped(run, "运行已停止")
-            await self.bus.publish(run.id, "run.cancelled", {"reason": run.error})
+            if run.shutting_down:
+                run.status = "running"
+                run.error = ""
+            else:
+                run.status = "cancelled"
+                run.error = run.error or "运行被中断"
+                self._mark_pending_skipped(run, "运行已停止")
+                await self.bus.publish(
+                    run.id, "run.cancelled", {"reason": run.error}
+                )
             raise
         except Exception as exc:  # noqa: BLE001 - top-level guard
             run.status = "failed"
@@ -1049,6 +1236,7 @@ class Orchestrator:
             # Finished runs are served from SQLite; keep memory bounded.
             self._runs.pop(run.id, None)
             self._running_tasks.pop(run.id, None)
+            self._guidance.pop(run.id, None)
 
     async def _finish(self, run: RunState) -> None:
         if run.cancelled:
@@ -1250,6 +1438,16 @@ class Orchestrator:
         provider_ids = run.cluster.get("provider_ids") or []
         return set(provider_ids) if provider_ids else None
 
+    def _remote_for(self, run: RunState) -> RemoteWorkspace | None:
+        device = (run.cluster or {}).get("device") or {}
+        if not device.get("id"):
+            return None
+        return RemoteWorkspace(
+            self.devices,
+            str(device["id"]),
+            str(device.get("workspace") or ""),
+        )
+
     async def _schedule(self, run: RunState) -> None:
         running: dict[asyncio.Task[Any], TaskState] = {}
         allowed_ids = self._allowed_ids(run)
@@ -1439,9 +1637,15 @@ class Orchestrator:
                 {"result": run.result, "usage": self._usage(run)},
             )
         except asyncio.CancelledError:
-            task.status = "skipped"
-            task.error = "运行已取消"
-            task.finished_at = now()
+            if run.shutting_down:
+                # Leave the task resumable; the startup recovery pass will
+                # put it back to pending and restore its checkpoint.
+                task.status = "pending"
+                task.error = ""
+            else:
+                task.status = "skipped"
+                task.error = "运行已取消"
+                task.finished_at = now()
             self.store.update_task(task)
             raise
         except (BudgetExceeded, RunCancelled) as exc:
@@ -1564,9 +1768,13 @@ class Orchestrator:
             run.error = str(exc)
             await self.bus.publish(run.id, "task.failed", {"error": str(exc)}, task.id)
         except asyncio.CancelledError:
-            task.status = "skipped"
-            task.error = "运行已取消"
-            task.finished_at = now()
+            if run.shutting_down:
+                task.status = "pending"
+                task.error = ""
+            else:
+                task.status = "skipped"
+                task.error = "运行已取消"
+                task.finished_at = now()
             raise
         except Exception as exc:  # noqa: BLE001 - task boundary
             task.status = "failed"
@@ -1584,34 +1792,55 @@ class Orchestrator:
         provider_id: str | None = None,
     ) -> None:
         upstream = self._upstream_summary(run, task)
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": agent.system_prompt
-                + f"\n你是集群成员「{agent.name}」，当前运行目标：{run.goal}",
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"任务：{task.title}\n"
-                    f"指令：{task.instruction}\n\n"
-                    f"上游结果摘要：\n{upstream or '（无，本任务是入口任务）'}\n\n"
-                    "请现在执行任务：需要事实时立即调用工具，不要只描述计划或说“我会……”。"
-                    "最终结论要基于工具结果，不要编造来源。"
-                ),
-            },
-        ]
-        observations: list[tuple[str, dict[str, Any], str]] = []
+        saved = task.checkpoint or {}
+        if saved.get("messages"):
+            # Resume after a process restart or a failed attempt. The last
+            # completed tool batch is already in the checkpoint; a tool that
+            # was in flight at crash time may run again (at-least-once).
+            messages = list(saved["messages"])
+            observations = [
+                (str(item[0]), dict(item[1]), str(item[2]))
+                for item in saved.get("observations", [])
+                if isinstance(item, list) and len(item) == 3
+            ]
+            nudged = bool(saved.get("nudged"))
+            start_step = max(0, int(saved.get("next_step") or 0))
+        else:
+            messages = [
+                {
+                    "role": "system",
+                    "content": agent.system_prompt
+                    + f"\n你是集群成员「{agent.name}」，当前运行目标：{run.goal}",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"任务：{task.title}\n"
+                        f"指令：{task.instruction}\n\n"
+                        f"上游结果摘要：\n{upstream or '（无，本任务是入口任务）'}\n\n"
+                        "请现在执行任务：需要事实时立即调用工具，不要只描述计划或说“我会……”。"
+                        "最终结论要基于工具结果，不要编造来源。"
+                    ),
+                },
+            ]
+            observations = []
+            nudged = False
+            start_step = 0
         ctx = tool_registry.build_context(
-            self.store, self.settings, run.id, task.id, mcp=self.mcp
+            self.store,
+            self.settings,
+            run.id,
+            task.id,
+            mcp=self.mcp,
+            remote=self._remote_for(run),
         )
         tool_schemas = tool_registry.schemas(agent.tools)
         if "mcp" in agent.tools and self.mcp is not None:
             tool_schemas += self.mcp.schemas()
         max_steps = min(agent.max_steps, self.settings.max_steps_per_task)
-        nudged = False
+        compacted_notified = False
 
-        for step in range(max_steps):
+        for step in range(start_step, max_steps):
             self._check_budget(run)
             if run.cancelled:
                 raise RunCancelled("用户取消")
@@ -1632,11 +1861,26 @@ class Orchestrator:
                     task.id,
                 )
 
+            context_messages, context_tokens = self._context_messages(messages)
+            if context_messages is not messages and not compacted_notified:
+                compacted_notified = True
+                await self.bus.publish(
+                    run.id,
+                    "context.compacted",
+                    {
+                        "task": task.title,
+                        "tokens_before": estimate_tokens(messages),
+                        "tokens_after": context_tokens,
+                        "messages": len(context_messages),
+                    },
+                    task.id,
+                )
+
             pump = _DeltaPump(
                 self.bus, run.id, task.id, agent.name, step + 1, "thinking"
             )
             response = await self.llm.chat(
-                messages,
+                context_messages,
                 tool_schemas or None,
                 task=task,
                 run=run,
@@ -1732,6 +1976,9 @@ class Orchestrator:
                         {"tool": call.name, "result": result[:1500]},
                         task.id,
                     )
+                self._save_checkpoint(
+                    task, messages, observations, nudged, step + 1
+                )
                 continue
 
             content = response.content.strip()
@@ -1754,9 +2001,13 @@ class Orchestrator:
                         ),
                     }
                 )
+                self._save_checkpoint(
+                    task, messages, observations, nudged, step + 1
+                )
                 continue
 
             task.result = content or "（模型未返回内容）"
+            self._clear_checkpoint(task)
             return
 
         # Reserve one extra turn for a conclusion without tools. This avoids
@@ -1772,8 +2023,9 @@ class Orchestrator:
                 ),
             }
         )
+        context_messages, _ = self._context_messages(messages)
         response = await self.llm.chat(
-            messages,
+            context_messages,
             None,
             task=task,
             run=run,
@@ -1806,6 +2058,7 @@ class Orchestrator:
                 + ("\n".join(lines) if lines else "没有可用的工具结果。")
             )
         task.result = content
+        self._clear_checkpoint(task)
 
     @staticmethod
     def _looks_like_plan(text: str) -> bool:
@@ -1875,8 +2128,92 @@ class Orchestrator:
                 parts.append(f"### {dep.title}\n{dep.result[:1200]}")
         return "\n\n".join(parts)
 
+    def _save_checkpoint(
+        self,
+        task: TaskState,
+        messages: list[dict[str, Any]],
+        observations: list[tuple[str, dict[str, Any], str]],
+        nudged: bool,
+        next_step: int,
+    ) -> None:
+        task.checkpoint = {
+            "messages": messages,
+            "observations": [
+                [name, args, result] for name, args, result in observations
+            ],
+            "nudged": nudged,
+            "next_step": next_step,
+        }
+        self.store.update_task(task)
+
+    def _clear_checkpoint(self, task: TaskState) -> None:
+        if task.checkpoint is None:
+            return
+        task.checkpoint = None
+        self.store.update_task(task)
+
+    def _context_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return a compact prompt view without touching the raw transcript.
+
+        Older tool/assistant turns are replaced by a short textual digest. The
+        originals remain in the step checkpoint, so replay and audit still see
+        the full L0 record.
+        """
+        tokens = estimate_tokens(messages)
+        if (
+            tokens <= self.settings.context_compact_tokens
+            or len(messages) <= 12
+        ):
+            return messages, tokens
+
+        keep = 10
+        start = max(2, len(messages) - keep)
+        # Never start the retained tail with an orphan tool result.
+        while start > 2 and messages[start].get("role") == "tool":
+            start -= 1
+        head = messages[:2]
+        middle = messages[2:start]
+        tail = messages[start:]
+        if not middle:
+            return messages, tokens
+
+        lines: list[str] = []
+        for item in middle:
+            role = item.get("role", "unknown")
+            content = str(item.get("content") or "").replace("\n", " ")
+            if role == "tool":
+                lines.append(f"- 工具结果：{content[:300]}")
+            elif role == "assistant":
+                names = [
+                    str((call.get("function") or {}).get("name") or "")
+                    for call in item.get("tool_calls") or []
+                ]
+                suffix = f" [调用 {', '.join(n for n in names if n)}]" if names else ""
+                lines.append(f"- 助手：{content[:300]}{suffix}")
+            elif role == "user":
+                lines.append(f"- 用户：{content[:300]}")
+        digest = "【较早步骤的上下文压缩（完整原文仍在运行记录中）】\n" + "\n".join(
+            lines
+        )
+        if len(digest) > 6000:
+            digest = digest[:6000] + "\n…（更早内容已省略）"
+        compacted = [
+            head[0],
+            head[1],
+            {"role": "user", "content": digest},
+            *tail,
+        ]
+        return compacted, estimate_tokens(compacted)
+
     async def _finalize(self, run: RunState) -> str:
-        finished = [t for t in run.tasks if t.status == "done" and t.result]
+        max_round = max((task.round for task in run.tasks), default=1)
+        finished = [
+            t
+            for t in run.tasks
+            if t.round == max_round and t.status == "done" and t.result
+        ]
         if self.llm.is_mock or not finished:
             body = "\n\n".join(f"## {t.title}\n{t.result}" for t in finished)
             return f"# 集群执行完成\n\n目标：{run.goal}\n\n{body}\n\n---\n{self._usage_line(run)}"

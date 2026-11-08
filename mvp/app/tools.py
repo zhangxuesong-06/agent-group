@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from .config import Settings
+from .devices import REMOTE_TOOL_OPS
 from .store import Store
 
 
@@ -812,6 +813,19 @@ async def call(name: str, args: dict[str, Any], ctx: dict[str, Any]) -> str:
         if len(result) > 8000:
             result = result[:8000] + "\n...[截断]"
         return result
+    if not isinstance(args, dict):
+        raise ValueError("工具参数必须是对象")
+    remote = ctx.get("remote")
+    if remote is not None and name in REMOTE_TOOL_OPS:
+        # Keep server-side safety checks even when the command runs remotely.
+        if name == "run_command":
+            if not ctx["settings"].shell_enabled:
+                raise ValueError("命令执行已禁用（ENABLE_SHELL=0）")
+            _check_command(str(args.get("command") or ""))
+        result = await remote.call(name, args)
+        if len(result) > 8000:
+            result = result[:8000] + "\n...[截断]"
+        return result
     tool = TOOLS.get(name)
     if tool is None:
         raise ValueError(f"未知工具: {name}")
@@ -829,6 +843,7 @@ def build_context(
     run_id: str,
     task_id: str,
     mcp: Any = None,
+    remote: Any = None,
 ) -> dict[str, Any]:
     return {
         "store": store,
@@ -836,4 +851,5 @@ def build_context(
         "run_id": run_id,
         "task_id": task_id,
         "mcp": mcp,
+        "remote": remote,
     }

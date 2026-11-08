@@ -4,12 +4,20 @@ import asyncio
 import hmac
 import json
 import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import unquote
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +27,7 @@ from .approvals import ApprovalManager
 from .bus import EventBus
 from .clusters import build_cluster_snapshot, cluster_public
 from .config import settings
+from .devices import DeviceHub, hash_worker_token, new_worker_token
 from .evaluation import EVAL_TESTS, EvaluationRunner
 from .llm import LLMClient
 from .mcp import MCPManager
@@ -29,6 +38,7 @@ from .models import (
     Budget,
     ClusterInput,
     CreateRunRequest,
+    DeviceInput,
     MessageInput,
     MCPServerInput,
     ProviderEnabledInput,
@@ -85,6 +95,7 @@ registry = AgentRegistry()
 router = ModelRouter(store)
 approvals = ApprovalManager(bus, settings.approval_timeout)
 mcp_manager = MCPManager(store, settings)
+device_hub = DeviceHub()
 orchestrator = Orchestrator(
     store,
     bus,
@@ -94,6 +105,7 @@ orchestrator = Orchestrator(
     router,
     approvals=approvals,
     mcp=mcp_manager,
+    devices=device_hub,
 )
 evaluator = EvaluationRunner(store, llm, settings)
 
@@ -109,8 +121,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 - MCP errors must not block the web UI
         pass
     try:
+        recovered = await orchestrator.recover_interrupted_runs()
+        if recovered:
+            print(f"  [recover] resumed {len(recovered)} interrupted run(s): {', '.join(recovered)}")
+    except Exception as exc:  # noqa: BLE001 - recovery must not block the web UI
+        print(f"  [recover] failed: {type(exc).__name__}: {exc}")
+    try:
         yield
     finally:
+        try:
+            await orchestrator.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await mcp_manager.stop_all()
         except Exception:  # noqa: BLE001
@@ -508,6 +530,92 @@ def _runtime_settings() -> dict:
     }
 
 
+@app.get("/api/devices")
+async def list_devices() -> dict:
+    online = device_hub.online_ids()
+    devices = []
+    for device in store.list_devices():
+        devices.append({**device, "online": device["id"] in online})
+    return {"devices": devices}
+
+
+@app.post("/api/devices", status_code=201)
+async def create_device(body: DeviceInput) -> dict:
+    token = new_worker_token()
+    device = store.create_device(body.name, hash_worker_token(token))
+    public = {key: value for key, value in device.items() if key != "token_hash"}
+    public["online"] = False
+    return {"device": public, "token": token}
+
+
+@app.delete("/api/devices/{device_id}")
+async def delete_device(device_id: str) -> dict:
+    record = store.get_device(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    device_hub.detach(device_id)
+    store.delete_device(device_id)
+    return {"deleted": True}
+
+
+@app.websocket("/api/worker/ws")
+async def worker_socket(websocket: WebSocket, token: str = Query(default="")) -> None:
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    record = store.get_device_by_token_hash(hash_worker_token(token))
+    if record is None:
+        await websocket.close(code=4401, reason="invalid worker token")
+        return
+    await websocket.accept()
+    device_id = record["id"]
+    try:
+        hello = await asyncio.wait_for(websocket.receive_json(), timeout=20)
+        workspaces = [
+            str(item).strip()
+            for item in (hello.get("workspaces") or [])
+            if str(item).strip()
+        ][:32]
+        platform = str(hello.get("platform") or "")[:120]
+        name = str(hello.get("name") or record["name"])[:80]
+        store.update_device(
+            device_id,
+            name=name,
+            platform=platform,
+            workspaces=workspaces,
+            last_seen=time.time(),
+        )
+        await device_hub.attach(device_id, websocket)
+        await websocket.send_json(
+            {"type": "welcome", "device_id": device_id, "name": name}
+        )
+        while True:
+            message = await websocket.receive_json()
+            kind = message.get("type")
+            if kind == "result":
+                device_hub.resolve(device_id, message)
+            elif kind in ("heartbeat", "ping"):
+                store.update_device(device_id, last_seen=time.time())
+                await websocket.send_json({"type": "pong"})
+            elif kind == "hello":
+                workspaces = [
+                    str(item).strip()
+                    for item in (message.get("workspaces") or [])
+                    if str(item).strip()
+                ][:32]
+                store.update_device(
+                    device_id,
+                    name=str(message.get("name") or name)[:80],
+                    platform=str(message.get("platform") or platform)[:120],
+                    workspaces=workspaces,
+                    last_seen=time.time(),
+                )
+    except (WebSocketDisconnect, asyncio.TimeoutError, RuntimeError):
+        pass
+    finally:
+        device_hub.detach(device_id, websocket)
+
+
 @app.get("/api/settings")
 async def get_runtime_settings() -> dict:
     return _runtime_settings()
@@ -706,7 +814,35 @@ async def create_run(body: CreateRunRequest) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    run_id = await orchestrator.start(body.goal, body.budget, cluster=cluster)
+
+    device = None
+    if body.device_id:
+        record = store.get_device(body.device_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="设备不存在")
+        if not device_hub.online(record["id"]):
+            raise HTTPException(status_code=409, detail="目标设备当前不在线")
+        workspace = (body.workspace or "").strip()
+        if not workspace:
+            roots = record.get("workspaces") or []
+            if not roots:
+                raise HTTPException(
+                    status_code=400, detail="设备尚未上报可用工作区"
+                )
+            workspace = roots[0]
+        if workspace not in (record.get("workspaces") or []):
+            raise HTTPException(
+                status_code=400, detail="该工作区不在设备授权列表中"
+            )
+        device = {
+            "id": record["id"],
+            "name": record["name"],
+            "workspace": workspace,
+        }
+
+    run_id = await orchestrator.start(
+        body.goal, body.budget, cluster=cluster, device=device
+    )
     return {"run_id": run_id, "status": "planning"}
 
 
@@ -832,6 +968,13 @@ async def rerun(run_id: str) -> dict:
     if budget_data.get("deadline_sec") == 900:
         budget_data["deadline_sec"] = settings.deadline_sec
     cluster = run.get("cluster") or {}
+    device = cluster.get("device") or None
+    if device is not None:
+        record = store.get_device(device.get("id", ""))
+        if record is None or not device_hub.online(record["id"]):
+            raise HTTPException(status_code=409, detail="原设备当前不在线")
+        if device.get("workspace") not in (record.get("workspaces") or []):
+            raise HTTPException(status_code=400, detail="原设备工作区已失效")
     if cluster.get("id"):
         try:
             cluster = build_cluster_snapshot(
@@ -843,7 +986,7 @@ async def rerun(run_id: str) -> dict:
         except ValueError:
             pass
     new_run_id = await orchestrator.start(
-        run["goal"], Budget(**budget_data), cluster=cluster
+        run["goal"], Budget(**budget_data), cluster=cluster, device=device
     )
     return {"run_id": new_run_id, "status": "planning"}
 

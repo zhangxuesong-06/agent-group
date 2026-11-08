@@ -1,0 +1,36 @@
+services:
+  cluster:
+    build: ./mvp
+    image: ai-cluster:cloud
+    environment:
+      DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: "8000"
+      ACCESS_TOKEN: ${ACCESS_TOKEN:?set ACCESS_TOKEN in .env.cloud}
+    volumes:
+      - cluster-data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      - cluster
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env.cloud}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  cluster-data:
+  caddy-data:
+  caddy-config:
