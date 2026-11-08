@@ -16,6 +16,8 @@ class ApprovalManager:
         self.timeout = max(10, timeout)
         self._pending: dict[str, dict[str, Any]] = {}
         self._futures: dict[str, asyncio.Future[bool]] = {}
+        # Runs where the user chose "allow for this run".
+        self._run_allowed: set[str] = set()
 
     async def request(
         self,
@@ -24,6 +26,8 @@ class ApprovalManager:
         tool: str,
         args: dict[str, Any],
     ) -> bool:
+        if run_id in self._run_allowed:
+            return True
         approval_id = new_id("appr")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[bool] = loop.create_future()
@@ -66,11 +70,15 @@ class ApprovalManager:
         items.sort(key=lambda item: item["created_at"])
         return items
 
-    async def resolve(self, approval_id: str, approved: bool) -> dict[str, Any] | None:
+    async def resolve(
+        self, approval_id: str, approved: bool, scope: str = "once"
+    ) -> dict[str, Any] | None:
         record = self._pending.get(approval_id)
         future = self._futures.get(approval_id)
         if record is None or future is None or future.done():
             return None
+        if approved and scope == "run":
+            self._run_allowed.add(record["run_id"])
         future.set_result(approved)
         await self.bus.publish(
             record["run_id"],
@@ -83,6 +91,9 @@ class ApprovalManager:
             record.get("task_id"),
         )
         return record
+
+    def forget_run(self, run_id: str) -> None:
+        self._run_allowed.discard(run_id)
 
     def cancel_run(self, run_id: str) -> int:
         count = 0

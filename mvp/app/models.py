@@ -115,6 +115,7 @@ class RuntimeSettingsInput(BaseModel):
 
 class ApprovalInput(BaseModel):
     approved: bool
+    scope: Literal["once", "run"] = "once"
 
 
 class MCPServerInput(BaseModel):

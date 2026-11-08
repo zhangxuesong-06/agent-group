@@ -765,6 +765,49 @@
   }
   .provider-status.ok { color: var(--ok); }
   .provider-status.err { color: var(--bad); }
+  .access-recommended {
+    display: flex; gap: 14px; align-items: center; margin: 14px 0;
+    padding: 14px; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--panel);
+  }
+  .access-qr {
+    flex: 0 0 auto; width: 132px; height: 132px; padding: 6px;
+    background: #fff; border-radius: 10px; display: flex;
+    align-items: center; justify-content: center;
+  }
+  .access-qr img { width: 100%; height: 100%; display: block; }
+  .access-main { min-width: 0; flex: 1; }
+  .access-label {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; margin-bottom: 5px;
+  }
+  .access-url {
+    color: var(--accent); font-size: 15px; font-weight: 600;
+    word-break: break-all; text-decoration: none;
+  }
+  .access-url:hover { text-decoration: underline; }
+  .access-items { display: grid; gap: 8px; margin: 12px 0; }
+  .access-item {
+    display: flex; align-items: center; gap: 10px; justify-content: space-between;
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px;
+    background: var(--panel); font-size: 12px;
+  }
+  .access-item .url { color: var(--text); word-break: break-all; }
+  .access-item .tag {
+    color: var(--muted); font-size: 10.5px; border: 1px solid var(--line);
+    border-radius: 999px; padding: 2px 7px; white-space: nowrap;
+  }
+  .access-item .tag.best { color: var(--accent); border-color: var(--accent); }
+  .access-note {
+    font-size: 12px; line-height: 1.75; color: var(--muted);
+    border-left: 2px solid var(--line); padding-left: 10px; margin: 12px 0;
+  }
+  .access-note code, .settings-hint code {
+    background: #0a0f1a; border: 1px solid var(--line); border-radius: 5px;
+    padding: 1px 5px; font-size: 11.5px;
+  }
+  .access-worker { margin-top: 16px; }
+  .access-worker .approval-command { margin-top: 8px; }
 
   /* mobile */
   @media (max-width: 760px) {
@@ -801,6 +844,9 @@
     .routing-score-grid { grid-template-columns: repeat(3, 1fr); }
     .settings-tab { flex: 1; }
     .mcp-item { flex-direction: column; }
+    .access-recommended { flex-direction: column; align-items: flex-start; }
+    .access-qr { width: 160px; height: 160px; align-self: center; }
+    .access-item { flex-direction: column; align-items: flex-start; }
     .profile-summary { grid-template-columns: 1fr 1fr; }
   }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -828,13 +874,15 @@
       <h3>设置</h3>
       <button class="icon-btn" id="providerClose" title="关闭">×</button>
     </div>
-    <p>在这里管理模型列表、集群预设、路由评分、工作区和 MCP。模型可以按供应商分组或以模型为主平铺显示；集群决定每次任务使用哪些模型。API Key 只保存在本机服务器数据库，接口只返回掩码。</p>
+    <p>在这里管理模型列表、集群预设、路由评分、工作区、设备、访问方式和 MCP。模型可以按供应商分组或以模型为主平铺显示；集群决定每次任务使用哪些模型。API Key 只保存在本机服务器数据库，接口只返回掩码。</p>
     <div class="workspace-note" id="workspaceNote"></div>
     <div class="settings-tabs">
       <button class="settings-tab active" data-tab="providers" type="button">模型列表</button>
       <button class="settings-tab" data-tab="clusters" type="button">集群预设</button>
       <button class="settings-tab" data-tab="routing" type="button">模型路由评分</button>
       <button class="settings-tab" data-tab="workspace" type="button">工作区</button>
+      <button class="settings-tab" data-tab="devices" type="button">设备</button>
+      <button class="settings-tab" data-tab="access" type="button">访问</button>
       <button class="settings-tab" data-tab="mcp" type="button">MCP 工具</button>
     </div>
     <div class="settings-pane" id="settingsProviders">
@@ -995,6 +1043,55 @@
       </div>
       <div class="provider-status" id="wsStatus"></div>
     </div>
+    <div class="settings-pane" id="settingsDevices" hidden>
+      <p class="settings-hint">在目标设备上运行 worker，让它主动连接本服务器。设备上线后，可以在底部输入框选择该设备的工作区；文件读写和命令会在那台设备上执行。</p>
+      <div class="provider-list-head">
+        <span id="deviceCount">已配对设备</span>
+        <button class="ghost" id="deviceNew" type="button">＋ 配对设备</button>
+      </div>
+      <div id="deviceList"></div>
+      <div id="devicePairSection" hidden>
+        <label>设备名称<input id="deviceName" maxlength="80" placeholder="例如：我的工作站" /></label>
+        <div class="form-actions">
+          <button class="ghost" id="devicePairCancel" type="button">取消</button>
+          <button class="primary" id="devicePairCreate" type="button">生成 token</button>
+        </div>
+        <div id="devicePairResult" hidden>
+          <p class="settings-hint">token 只显示这一次，请立刻复制到设备端。设备端运行：</p>
+          <pre class="approval-command" id="devicePairCommand"></pre>
+          <div class="form-actions">
+            <button class="ghost" id="devicePairCopy" type="button">复制命令</button>
+          </div>
+        </div>
+      </div>
+      <div class="provider-status" id="deviceStatus"></div>
+    </div>
+    <div class="settings-pane" id="settingsAccess" hidden>
+      <p class="settings-hint">手机只当控制器：用手机浏览器打开下面的地址，发任务、审批、看结果。真正的文件读写和命令仍在已配对的电脑 worker 上执行。</p>
+      <div class="provider-list-head">
+        <span id="accessSummary">正在检测网络…</span>
+        <button class="ghost" id="accessRefresh" type="button">重新检测</button>
+      </div>
+      <div class="access-recommended" id="accessRecommended" hidden>
+        <div class="access-qr"><img id="accessQr" alt="扫码打开" /></div>
+        <div class="access-main">
+          <div class="access-label">推荐地址</div>
+          <a class="access-url" id="accessUrl" href="#" target="_blank" rel="noreferrer"></a>
+          <div class="settings-hint" style="margin:6px 0 0">手机扫码即可打开；首次需要输入 <code>ACCESS_TOKEN</code>。</div>
+        </div>
+      </div>
+      <div id="accessList"></div>
+      <div class="access-note" id="accessHint"></div>
+      <div class="access-worker">
+        <div class="access-label">设备 worker 连接命令</div>
+        <pre class="approval-command" id="accessWorkerCommand"></pre>
+        <div class="form-actions">
+          <button class="ghost" id="accessWorkerCopy" type="button">复制命令</button>
+        </div>
+        <p class="settings-hint">把 <code>--token</code> 换成「设备」页生成的 token，<code>--workspace</code> 换成那台电脑上的目录。</p>
+      </div>
+      <div class="provider-status" id="accessStatus"></div>
+    </div>
     <div class="settings-pane" id="settingsMcp" hidden>
       <p class="settings-hint">连接 MCP（Model Context Protocol）服务器后，其工具会自动注册给 Agent。支持本地 stdio 进程、SSE 和 Streamable HTTP；配置保存在本机数据库。</p>
       <div class="provider-list-head">
@@ -1079,6 +1176,7 @@
     <pre class="approval-command" id="approvalCommand"></pre>
     <div class="form-actions">
       <button class="ghost" id="approvalReject" type="button">拒绝</button>
+      <button class="ghost" id="approvalApproveRun" type="button">本次运行都允许</button>
       <button class="primary" id="approvalApprove" type="button">批准执行</button>
     </div>
   </div>
@@ -1260,6 +1358,8 @@ const state = {
   titleTimer: null, baseTitle: document.title, audioCtx: null,
   clusters: [], defaultClusterId: null,
   devices: [], deviceId: localStorage.getItem("ai_device_id") || "",
+  pendingDeviceCommand: "",
+  network: null, accessQr: null, accessWorkerCommand: "",
   workspace: localStorage.getItem("ai_workspace") || "",
   clusterId: localStorage.getItem("ai_cluster_id") || "",
   clusterMode: localStorage.getItem("ai_cluster_mode") !== "0",
@@ -2469,7 +2569,15 @@ function setSettingsTab(name) {
   $("settingsClusters").hidden = name !== "clusters";
   $("settingsRouting").hidden = name !== "routing";
   $("settingsWorkspace").hidden = name !== "workspace";
+  $("settingsDevices").hidden = name !== "devices";
   $("settingsMcp").hidden = name !== "mcp";
+  $("settingsAccess").hidden = name !== "access";
+  if (name === "devices") {
+    loadDevices().then(() => renderDeviceList()).catch(() => {});
+  }
+  if (name === "access") {
+    loadNetwork();
+  }
   if (name === "clusters") {
     loadClusters().then(() => renderClusterList()).catch(() => {});
   }
@@ -3007,7 +3115,8 @@ async function loadDevices() {
     const data = await api("/api/devices");
     state.devices = data.devices || [];
   } catch (err) {
-    state.devices = [];
+    // Keep the last known list/selection on a transient network failure.
+    return;
   }
   const current = state.devices.find((device) => device.id === state.deviceId);
   if (state.deviceId && !current) {
@@ -3058,6 +3167,196 @@ function renderDeviceSelect() {
     .join("");
   if (!roots.includes(state.workspace)) state.workspace = roots[0];
   workspaceSelect.value = state.workspace;
+}
+
+function renderDeviceList() {
+  const list = $("deviceList");
+  if (!list) return;
+  $("deviceCount").textContent = state.devices.length
+    ? `${state.devices.length} 台设备`
+    : "还没有配对设备";
+  if (!state.devices.length) {
+    list.innerHTML = `<div class="empty" style="padding:18px">还没有配对设备。点右上角「配对设备」生成 token。</div>`;
+    return;
+  }
+  list.innerHTML = state.devices
+    .map(
+      (device) => `<div class="mcp-item">
+        <div class="mcp-main">
+          <div class="mcp-name">
+            <b>${esc(device.name)}</b>
+            <span class="mcp-badge">${device.online ? "在线" : "离线"}</span>
+            ${device.platform ? `<span class="mcp-badge">${esc(device.platform)}</span>` : ""}
+          </div>
+          <div class="mcp-meta">${(device.workspaces || []).length ? (device.workspaces || []).map((root) => esc(root)).join("<br>") : "尚未上报工作区"}</div>
+          <div class="mcp-meta">${device.last_seen ? "最近连接：" + new Date(device.last_seen * 1000).toLocaleString("zh-CN") : "从未连接"}</div>
+        </div>
+        <div class="mcp-tools">
+          <button class="ghost" data-device-del="${esc(device.id)}" type="button">删除</button>
+        </div>
+      </div>`
+    )
+    .join("");
+}
+
+function openDevicePair() {
+  $("devicePairSection").hidden = false;
+  $("devicePairResult").hidden = true;
+  $("deviceName").value = "";
+  $("deviceName").focus();
+}
+
+async function createDevice() {
+  const name = $("deviceName").value.trim();
+  if (!name) { toast("先写设备名称"); return; }
+  $("devicePairCreate").disabled = true;
+  try {
+    const data = await api("/api/devices", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    const token = data.token;
+    const command = `python -m mvp.worker.agent --server ${location.origin} --token ${token} --name "${name}" --workspace "<本机工作区绝对路径>"`;
+    $("devicePairCommand").textContent = command;
+    $("devicePairResult").hidden = false;
+    state.pendingDeviceCommand = command;
+    await loadDevices();
+    renderDeviceList();
+    toast("设备已创建，token 只显示这一次");
+  } catch (err) {
+    toast("创建设备失败：" + err.message);
+  } finally {
+    $("devicePairCreate").disabled = false;
+  }
+}
+
+async function deleteDevice(deviceId) {
+  const device = state.devices.find((item) => item.id === deviceId);
+  const ok = await showConfirm({
+    title: "删除设备",
+    message: `删除「${device ? device.name : deviceId}」？该设备的 token 会立即失效。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+    await loadDevices();
+    renderDeviceList();
+    toast("设备已删除");
+  } catch (err) {
+    toast("删除失败：" + err.message);
+  }
+}
+
+async function loadNetwork(force = false) {
+  const status = $("accessStatus");
+  try {
+    if (status) { status.textContent = "正在检测网络…"; status.className = "provider-status"; }
+    const data = await api("/api/network" + (force ? "?t=" + Date.now() : ""));
+    state.network = data;
+    renderAccess();
+    if (status) { status.textContent = ""; status.className = "provider-status"; }
+  } catch (err) {
+    if (status) {
+      status.textContent = "检测失败：" + err.message;
+      status.className = "provider-status err";
+    }
+  }
+}
+
+async function renderAccessQr(url) {
+  const img = $("accessQr");
+  if (!img) return;
+  if (state.accessQr?.url === url && state.accessQr.blobUrl) {
+    img.src = state.accessQr.blobUrl;
+    return;
+  }
+  try {
+    const headers = {};
+    if (state.token) headers.Authorization = "Bearer " + state.token;
+    const res = await fetch("/api/network/qr?url=" + encodeURIComponent(url), { headers });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const blob = await res.blob();
+    if (state.accessQr?.blobUrl) URL.revokeObjectURL(state.accessQr.blobUrl);
+    const blobUrl = URL.createObjectURL(blob);
+    state.accessQr = { url, blobUrl };
+    img.src = blobUrl;
+  } catch (err) {
+    img.removeAttribute("src");
+  }
+}
+
+function renderAccess() {
+  const data = state.network;
+  if (!data) return;
+  const tailscale = data.tailscale || {};
+  const recommended = data.recommended || "";
+  const urls = data.urls || [];
+
+  const summary = $("accessSummary");
+  if (summary) {
+    if (tailscale.installed) {
+      summary.textContent = `${data.hostname} · Tailscale ${tailscale.online ? "已连接" : "未连接"}`;
+    } else {
+      summary.textContent = `${data.hostname} · 未安装 Tailscale`;
+    }
+  }
+
+  const box = $("accessRecommended");
+  if (box) box.hidden = !recommended;
+  if (recommended) {
+    const link = $("accessUrl");
+    link.textContent = recommended;
+    link.href = recommended;
+    renderAccessQr(recommended);
+  }
+
+  const list = $("accessList");
+  if (list) {
+    list.innerHTML = urls.length
+      ? `<div class="access-items">${urls
+          .map((item) => {
+            const best = item.url === recommended;
+            return `<div class="access-item">
+              <span class="url">${esc(item.url)}</span>
+              <span class="tag${best ? " best" : ""}">${esc(item.label)}${best ? " · 推荐" : ""}</span>
+            </div>`;
+          })
+          .join("")}</div>`
+      : "";
+  }
+
+  const hint = $("accessHint");
+  if (hint) {
+    const dns = tailscale.dns_name || "";
+    const lines = [];
+    if (!tailscale.installed) {
+      lines.push("这台服务器还没装 Tailscale。装好后手机和电脑登录同一个 tailnet，就能用上面的地址互相访问，不需要开放公网端口。");
+      lines.push("Windows / macOS：从 tailscale.com/download 安装并登录；Linux：<code>curl -fsSL https://tailscale.com/install.sh | sh</code> 然后 <code>sudo tailscale up</code>。");
+    } else if (!tailscale.online) {
+      lines.push("检测到 Tailscale，但当前没有连上。运行 <code>tailscale up</code> 并登录后再点「重新检测」。");
+      if (tailscale.error) lines.push(`状态信息：${esc(tailscale.error)}`);
+    } else {
+      lines.push("手机装 Tailscale 并登录同一个 tailnet，扫上面的二维码即可打开。首次需要输入 ACCESS_TOKEN。");
+      if (dns) {
+        lines.push(`想要 HTTPS 地址：在服务器上运行 <code>tailscale serve --bg ${data.port || 8000}</code>，然后访问 <code>https://${esc(dns)}</code>。不要用 Funnel，除非你确实想公开到公网。`);
+      }
+    }
+    lines.push("手机只负责控制和审批；文件读写与命令执行仍由已配对的电脑 worker 完成。");
+    if (recommended && /127\.0\.0\.1|localhost|\[::1\]/.test(recommended)) {
+      lines.unshift("当前只能拿到本机地址，手机打不开。请让服务器和手机连同一个 Tailscale tailnet，或确认在同一 Wi-Fi 且服务器监听 0.0.0.0。");
+    }
+    hint.innerHTML = lines.join("<br>");
+  }
+
+  const commandEl = $("accessWorkerCommand");
+  if (commandEl) {
+    const base = recommended || location.origin;
+    const server = base.replace(/\/+$/, "");
+    state.accessWorkerCommand = `python -m mvp.worker.agent --server ${server} --token <设备 token> --name "我的电脑" --workspace "<本机工作区绝对路径>"`;
+    commandEl.textContent = state.accessWorkerCommand;
+  }
 }
 
 function updateClusterUI() {
@@ -3809,6 +4108,7 @@ function showApproval(approval) {
     `${args.cwd ? " · 目录 " + args.cwd : ""}`;
   $("approvalCommand").textContent = command;
   $("approvalApprove").disabled = false;
+  $("approvalApproveRun").disabled = false;
   $("approvalReject").disabled = false;
   $("approvalModal").hidden = false;
   startApprovalAlert(approval);
@@ -3817,22 +4117,30 @@ function showApproval(approval) {
   }
 }
 
-async function resolveApproval(approved) {
+async function resolveApproval(approved, scope = "once") {
   const current = state.approval;
   if (!current) return;
   $("approvalApprove").disabled = true;
+  $("approvalApproveRun").disabled = true;
   $("approvalReject").disabled = true;
   try {
     await api(`/api/approvals/${encodeURIComponent(current.id)}`, {
       method: "POST",
-      body: JSON.stringify({ approved }),
+      body: JSON.stringify({ approved, scope }),
     });
     state.approvalHandled.add(current.id);
     if (state.approvalHandled.size > 200) state.approvalHandled.clear();
-    toast(approved ? "已批准执行" : "已拒绝执行");
+    toast(
+      approved
+        ? scope === "run"
+          ? "本次运行后续命令将自动批准"
+          : "已批准执行"
+        : "已拒绝执行"
+    );
   } catch (err) {
     toast("审批提交失败：" + err.message);
     $("approvalApprove").disabled = false;
+    $("approvalApproveRun").disabled = false;
     $("approvalReject").disabled = false;
     return;
   }
@@ -4455,6 +4763,16 @@ function bindUI() {
     else if (button.dataset.act === "delete") deleteCluster(button.dataset.id);
     else if (button.dataset.act === "default") makeDefaultCluster(button.dataset.id);
   };
+  $("deviceNew").onclick = openDevicePair;
+  $("devicePairCancel").onclick = () => { $("devicePairSection").hidden = true; };
+  $("devicePairCreate").onclick = createDevice;
+  $("devicePairCopy").onclick = () => copyText(state.pendingDeviceCommand);
+  $("deviceList").onclick = (e) => {
+    const button = e.target.closest("button[data-device-del]");
+    if (button) deleteDevice(button.dataset.deviceDel);
+  };
+  $("accessRefresh").onclick = () => loadNetwork(true);
+  $("accessWorkerCopy").onclick = () => copyText(state.accessWorkerCommand);
   $("historyToggle").onclick = () => {
     state.historyCollapsed = !state.historyCollapsed;
     localStorage.setItem("ai_history_collapsed", state.historyCollapsed ? "1" : "0");
@@ -4505,8 +4823,9 @@ function bindUI() {
   $("confirmModal").addEventListener("click", (e) => {
     if (e.target === $("confirmModal")) closeConfirm(false);
   });
-  $("approvalApprove").onclick = () => resolveApproval(true);
-  $("approvalReject").onclick = () => resolveApproval(false);
+  $("approvalApprove").onclick = () => resolveApproval(true, "once");
+  $("approvalApproveRun").onclick = () => resolveApproval(true, "run");
+  $("approvalReject").onclick = () => resolveApproval(false, "once");
   $("routingList").onclick = (e) => {
     const btn = e.target.closest('button[data-act="autoscore"]');
     if (btn) autoscoreProvider(btn.dataset.id);

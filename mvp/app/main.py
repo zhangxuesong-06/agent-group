@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import io
 import json
 import shutil
 import time
@@ -19,8 +20,14 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
+import segno
 
 from .agents import AgentRegistry
 from .approvals import ApprovalManager
@@ -31,6 +38,7 @@ from .devices import DeviceHub, hash_worker_token, new_worker_token
 from .evaluation import EVAL_TESTS, EvaluationRunner
 from .llm import LLMClient
 from .mcp import MCPManager
+from .network import network_info
 from .models import (
     ApprovalInput,
     BatchScoreInput,
@@ -616,6 +624,27 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
         device_hub.detach(device_id, websocket)
 
 
+@app.get("/api/network")
+async def get_network(request: Request) -> dict:
+    return network_info(
+        settings.port, str(request.base_url).rstrip("/")
+    )
+
+
+@app.get("/api/network/qr")
+async def network_qr(url: str = Query(min_length=1, max_length=500)) -> Response:
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="only http(s) URLs can be encoded")
+    qr = segno.make(url, error="m")
+    buffer = io.BytesIO()
+    qr.save(buffer, kind="svg", scale=6, border=2)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/settings")
 async def get_runtime_settings() -> dict:
     return _runtime_settings()
@@ -669,7 +698,9 @@ async def list_approvals(run_id: str | None = None) -> dict:
 
 @app.post("/api/approvals/{approval_id}")
 async def resolve_approval(approval_id: str, body: ApprovalInput) -> dict:
-    record = await approvals.resolve(approval_id, body.approved)
+    record = await approvals.resolve(
+        approval_id, body.approved, scope=body.scope
+    )
     if record is None:
         raise HTTPException(status_code=404, detail="审批已失效或已被处理")
     return {"resolved": True, "approved": body.approved}
@@ -1019,6 +1050,7 @@ async def delete_run(run_id: str) -> dict:
     if orchestrator.is_active(run_id):
         raise HTTPException(status_code=409, detail="运行仍在进行，请先取消")
     store.delete_run(run_id)
+    approvals.forget_run(run_id)
     shutil.rmtree(settings.artifact_dir / run_id, ignore_errors=True)
     return {"deleted": True}
 

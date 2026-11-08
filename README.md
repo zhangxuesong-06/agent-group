@@ -329,10 +329,11 @@ Agent 不再只是“给建议”，现在可以直接在你的电脑上工作�
 1. Agent 调用 `run_command` 时先暂停，不会直接执行
 2. 网页弹出「命令待审批」，显示命令内容和所属运行/任务
 3. 点「批准执行」才真正运行；点「拒绝」则把错误返回给 Agent，让它调整方案
-4. 超过审批超时（默认 300 秒，可在设置里改）自动拒绝
-5. 停止运行会同时取消该运行所有待审批命令
+4. 点「本次运行都允许」后，该 Run 后续的 `run_command` 不再逐条询问
+5. 超过审批超时（默认 300 秒，可在设置里改）自动拒绝
+6. 停止运行会同时取消该运行所有待审批命令
 
-关闭审批后，命令会在工作区内自动执行。审批只覆盖本地 `run_command`；MCP 工具调用不受这一层审批控制。
+关闭审批后，命令会在工作区内自动执行。审批覆盖本地和远程设备的 `run_command`；MCP 工具调用不受这一层审批控制。
 
 ### MCP 工具接入
 
@@ -389,16 +390,18 @@ LLM_MODEL=gpt-4o-mini
 ### 从其他设备 / 云端访问
 
 - 局域网：直接用启动时打印的 `http://局域网IP:8000`
-- 跨网络个人使用：推荐 Tailscale，无需公网 IP 和端口映射
+- 跨网络个人使用：推荐 Tailscale，无需公网 IP 和端口映射（见 [`docs/tailscale.md`](docs/tailscale.md)）
 - 公网 HTTPS：Cloudflare Tunnel，务必同时设置 `ACCESS_TOKEN`
 - 7×24 云端：`docker compose --env-file deploy/.env.cloud -f docker-compose.cloud.yml up -d --build`（Caddy 自动 HTTPS）
-- **云端 + 远程工作区**：在每台电脑上运行 `mvp.worker.agent`，设备主动外连服务器；网页里选择在线设备和工作区后，文件/命令工具会在该设备执行
+- **云端 + 远程工作区**：设置 → 设备里配对 token，在每台电脑上运行 `mvp.worker.agent`；设备主动外连服务器。网页里选择在线设备和工作区后，文件/命令工具会在该设备执行
   - 服务器只暴露 80/443
   - 每台设备一个独立 token，按 workspace 根目录授权
   - 设备离线时不能创建新任务；运行中掉线会报工具错误，重新上线后可继续
 
 完整步骤、配对命令、安全清单和限制见
 [`docs/cloud-deployment.md`](docs/cloud-deployment.md)。
+只想自己用、不想开公网端口时，见 [`docs/tailscale.md`](docs/tailscale.md)：
+手机当控制器，通过 Tailscale 打开网页；执行仍在已配对的电脑 worker 上。
 旧的局域网/隧道方案见 [`docs/远程访问与部署.md`](docs/远程访问与部署.md)。
 
 ---
@@ -410,6 +413,7 @@ LLM_MODEL=gpt-4o-mini
 ├─ docs/
 │  ├─ 架构设计.md          # 组件、协议、可靠性、路线图、踩坑清单
 │  ├─ 远程访问与部署.md     # 局域网 / Tailscale / 隧道 / VPS / 可行性评估
+│  ├─ tailscale.md         # 手机接入：tailnet、serve、ACL、worker 地址
 │  └─ cloud-deployment.md  # 云端 + 远程设备工作区（WebSocket worker）
 ├─ mvp/
 │  ├─ app/
