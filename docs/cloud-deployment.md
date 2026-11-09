@@ -124,6 +124,17 @@ python -m mvp.worker.agent \
 - worker 断线会自动重连（1s → 30s 退避）。
 - 不需要在路由器上开端口；设备只发起 outbound `wss`。
 
+### Windows 一键启动
+
+仓库根目录运行 `start-worker.cmd`，首次会提示填服务器地址、token、名称和工作区，
+配置保存在 `mvp/data/worker.json`；以后双击直接连接。重配：
+
+```powershell
+.\start-worker.cmd --reset
+```
+
+需要 Python 3.10+；脚本会自动创建 `.venv` 并只安装 `websockets`。
+
 ## 4. 在网页里使用
 
 1. 打开 `https://cluster.example.com`，输入 `ACCESS_TOKEN`
@@ -154,7 +165,9 @@ python -m mvp.worker.agent \
 - 单用户单 `ACCESS_TOKEN`；多用户/RBAC 还没做。
 - 设备在线状态和 RPC 在单进程内存里；多副本部署需要 Redis/NATS 或数据库租约。
 - SQLite 适合单机/小规模；多用户或高并发建议迁移 PostgreSQL。
-- 任务运行中设备掉线时，该工具调用会失败；设备重新上线后可继续未完成任务。
+- 任务运行中设备掉线时，服务器会等待设备重连（默认 60 秒，`DEVICE_WAIT_SEC` 可调）：
+  - 只读操作（列目录、读文件）重连后自动重试；
+  - 写文件和命令不自动重试，避免重复执行，错误里会提示先检查结果。
 - 远程 worker 目前支持文件读写、编辑、列目录、执行命令；`web_search`、MCP、模型调用仍在服务器端。
 
 ## 7. 故障排查

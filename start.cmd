@@ -18,6 +18,12 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install -r mvp\requirements.txt || goto :error
 )
 
+".venv\Scripts\python.exe" -c "import fastapi, uvicorn, segno, websockets" >nul 2>&1
+if errorlevel 1 (
+  echo [setup] installing dependencies...
+  ".venv\Scripts\python.exe" -m pip install -r mvp\requirements.txt || goto :error
+)
+
 set OPEN_BROWSER=1
 ".venv\Scripts\python.exe" mvp\run.py
 if errorlevel 1 goto :error

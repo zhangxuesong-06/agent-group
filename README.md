@@ -54,6 +54,23 @@ python -m venv .venv
 .\.venv\Scripts\python.exe mvp\scripts\smoke.py
 ```
 
+### 在同一台电脑上跑 worker（本地测试）
+
+服务启动后，双击仓库根目录的 `start-worker.cmd`。首次会依次提示：
+
+1. 服务器地址 —— 直接回车用 `http://127.0.0.1:8000`
+2. 设备 token —— 网页「设置 → 设备 → ＋ 配对设备」生成
+3. 设备名称 —— 直接回车用电脑名
+4. 工作区绝对路径 —— 直接回车用 `mvp/data/workspace`，也可以填任意目录
+
+配置保存在 `mvp/data/worker.json`，以后双击直接连接。要重配就运行：
+
+```powershell
+.\start-worker.cmd --reset
+```
+
+worker 断开后会自动重连；按 `Ctrl+C` 停止。
+
 ### 在网页里配置模型（推荐）
 
 左下角点击「⚙ 设置 → 模型列表」：
@@ -431,13 +448,15 @@ LLM_MODEL=gpt-4o-mini
 │  │  └─ models.py         # 领域模型
 │  ├─ worker/agent.py      # 设备端 worker：外连服务器，执行工作区工具
 │  ├─ static/index.html    # 单页控制台（任务 DAG / 实时日志 / 交付物）
-│  ├─ scripts/pair_device.py  # 生成设备 token 与启动命令
+│  ├─ scripts/pair_device.py     # 生成设备 token 与启动命令
+│  ├─ scripts/worker_launcher.py # 交互式配置并启动 worker
 │  ├─ scripts/smoke.py     # 端到端冒烟测试
 │  ├─ Dockerfile
 │  └─ requirements.txt
 ├─ deploy/                 # Caddyfile + 云端环境变量样例
 ├─ docker-compose.cloud.yml
-├─ start.cmd / start.sh
+├─ start.cmd / start.sh    # 启动服务器
+├─ start-worker.cmd        # Windows 一键启动 worker
 ├─ docker-compose.yml
 └─ README.md
 ```
