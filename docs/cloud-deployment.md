@@ -139,7 +139,7 @@ python -m mvp.worker.agent \
 
 1. 打开 `https://cluster.example.com`，输入 `ACCESS_TOKEN`
 2. 底部输入框上方选择设备（在线设备会显示名称；离线会标注）
-3. 如果设备上报了多个工作区，再选择具体工作区
+3. 点「浏览…」逐级查看设备授权目录，选择子目录作为工作区；每台设备的选择会单独记住
 4. 正常发任务；文件读写、`run_command` 会在该设备的工作区执行
 
 运行详情里会显示 `设备名:工作区路径`。没有选择设备时显示「服务器本机」。
@@ -179,4 +179,5 @@ python -m mvp.worker.agent \
 | 工具报“路径超出工作区” | 请求的路径不在 `--workspace` 根目录内 |
 | 命令被拒绝 | 服务器审批拒绝，或 worker 危险命令拦截，或 `--no-shell` |
 | 网页能开但 WebSocket 失败 | 反向代理未转发 Upgrade 头；Caddy 默认支持，Nginx 需要显式配置 |
+| 访问页推荐的是内网地址 | 反向代理没有传原始 Host。Caddy 默认保留 Host；Nginx 用 `proxy_set_header Host $host;`，并加 `X-Forwarded-Proto` |
 | HTTPS 证书失败 | 域名 DNS 未指向服务器，或 80 端口被占用/未放行 |

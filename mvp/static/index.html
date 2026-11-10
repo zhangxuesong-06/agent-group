@@ -688,6 +688,35 @@
   .mcp-error { color: var(--bad); font-size: 11.5px; margin-top: 5px; white-space: pre-wrap; }
   .confirm-card { width: min(520px, 100%); }
   .approval-card { width: min(720px, 100%); }
+  .workspace-card { width: min(620px, 100%); }
+  .workspace-crumbs {
+    font-size: 12px; color: var(--muted); margin: 8px 0; word-break: break-all;
+  }
+  .workspace-crumbs b { color: var(--text); font-weight: 600; }
+  .workspace-crumbs .crumb { cursor: pointer; color: var(--accent); }
+  .workspace-crumbs .crumb:hover { text-decoration: underline; }
+  .workspace-crumbs .crumb-sep { color: var(--muted); margin: 0 4px; }
+  .workspace-list {
+    border: 1px solid var(--line); border-radius: 10px; max-height: 320px;
+    overflow: auto; background: #0a0f1a; min-height: 120px;
+  }
+  .workspace-row {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    cursor: pointer; border-bottom: 1px solid var(--line); font-size: 13px;
+  }
+  .workspace-row:last-child { border-bottom: 0; }
+  .workspace-row:hover { background: rgba(125, 211, 252, .08); }
+  .workspace-row .ico { color: var(--muted); }
+  .workspace-empty {
+    padding: 26px 14px; text-align: center; color: var(--muted); font-size: 12px;
+  }
+  .workspace-foot {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: 12px; flex-wrap: wrap;
+  }
+  .workspace-status { color: var(--muted); font-size: 12px; }
+  .workspace-status.err { color: var(--bad); }
+  .mcp-item.offline { opacity: .55; }
   .confirm-message {
     white-space: pre-wrap; color: var(--text); font-size: 13px;
     line-height: 1.8; margin: 4px 0 18px;
@@ -1192,6 +1221,24 @@
     </div>
   </div>
 </div>
+<div class="modal" id="workspaceModal" hidden>
+  <div class="modal-card workspace-card">
+    <div class="modal-head">
+      <h3>选择工作区目录</h3>
+      <button class="icon-btn" id="workspaceClose" type="button" title="关闭">×</button>
+    </div>
+    <p class="settings-hint">只会列出该设备授权的目录。选中的子目录会成为这次任务的 workspace，文件读写和命令都被限制在里面。</p>
+    <div class="workspace-crumbs" id="workspaceCrumbs"></div>
+    <div class="workspace-list" id="workspaceList"></div>
+    <div class="workspace-foot">
+      <span class="workspace-status" id="workspaceStatus"></span>
+      <div class="form-actions">
+        <button class="ghost" id="workspaceUp" type="button">上一级</button>
+        <button class="primary" id="workspaceUse" type="button">使用这个目录</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal" id="approvalModal" hidden>
   <div class="modal-card approval-card">
     <div class="modal-head">
@@ -1345,6 +1392,7 @@
           <label class="mode-toggle"><input id="clusterMode" type="checkbox" checked /> 集群模式</label>
           <select class="device-select" id="deviceSelect" title="任务在哪个设备的工作区执行"></select>
           <select class="device-select" id="workspaceSelect" title="设备授权的工作区" hidden></select>
+          <button class="ghost mini" id="workspaceBrowse" type="button" hidden title="浏览设备目录，选择子目录作为工作区">浏览…</button>
           <span class="hint-inline" id="clusterModeHint"></span>
         </div>
         <div class="composer-actions">
@@ -1385,6 +1433,7 @@ const state = {
   clusters: [], defaultClusterId: null,
   devices: [], deviceId: localStorage.getItem("ai_device_id") || "",
   pendingDeviceCommand: "",
+  workspaceMap: {}, browse: null,
   network: null, accessQr: null, accessWorkerCommand: "",
   workspace: localStorage.getItem("ai_workspace") || "",
   clusterId: localStorage.getItem("ai_cluster_id") || "",
@@ -3136,6 +3185,45 @@ function renderClusterSelect() {
   updateClusterUI();
 }
 
+function loadWorkspaceMap() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("ai_device_workspaces") || "{}");
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch (err) {
+    return {};
+  }
+}
+
+function saveWorkspaceChoice(deviceId, path) {
+  if (!deviceId || !path) return;
+  state.workspaceMap[deviceId] = path;
+  try {
+    localStorage.setItem("ai_device_workspaces", JSON.stringify(state.workspaceMap));
+  } catch (err) { /* ignore quota errors */ }
+  localStorage.setItem("ai_workspace", path);
+}
+
+function workspaceKey(path) {
+  return String(path || "").replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function workspaceUnderRoots(path, roots) {
+  const key = workspaceKey(path);
+  if (!key) return false;
+  return (roots || []).some((root) => {
+    const base = workspaceKey(root);
+    return !!base && (key === base || key.startsWith(base + "\\"));
+  });
+}
+
+function restoreWorkspaceFor(device) {
+  const roots = (device && device.workspaces) || [];
+  const saved = device ? state.workspaceMap[device.id] : "";
+  if (saved && workspaceUnderRoots(saved, roots)) return saved;
+  if (state.workspace && workspaceUnderRoots(state.workspace, roots)) return state.workspace;
+  return roots[0] || "";
+}
+
 async function loadDevices() {
   try {
     const data = await api("/api/devices");
@@ -3151,10 +3239,7 @@ async function loadDevices() {
     localStorage.setItem("ai_device_id", "");
     localStorage.setItem("ai_workspace", "");
   }
-  if (current) {
-    const roots = current.workspaces || [];
-    if (!roots.includes(state.workspace)) state.workspace = roots[0] || "";
-  }
+  if (current) state.workspace = restoreWorkspaceFor(current);
   renderDeviceSelect();
 }
 
@@ -3179,20 +3264,40 @@ function renderDeviceSelect() {
   const device = selectedDevice();
   select.classList.toggle("offline", !!device && !device.online);
 
+  const browseBtn = $("workspaceBrowse");
+  if (browseBtn) {
+    browseBtn.hidden = !device;
+    browseBtn.disabled = !device || !device.online;
+    browseBtn.title = device && !device.online
+      ? "设备离线，重连后才能浏览目录"
+      : "浏览设备目录，选择子目录作为工作区";
+  }
+
   const workspaceSelect = $("workspaceSelect");
   const roots = device ? device.workspaces || [] : [];
-  if (!device || roots.length <= 1) {
+  if (!device || !roots.length) {
     workspaceSelect.hidden = true;
     workspaceSelect.innerHTML = "";
-    if (device && roots.length === 1) state.workspace = roots[0];
     return;
   }
-  workspaceSelect.hidden = false;
-  workspaceSelect.innerHTML = roots
-    .map((root) => `<option value="${esc(root)}">${esc(root)}</option>`)
+  if (!state.workspace || !workspaceUnderRoots(state.workspace, roots)) {
+    state.workspace = roots[0];
+  }
+  const options = roots.slice();
+  const custom = !roots.includes(state.workspace);
+  if (custom) options.push(state.workspace);
+  workspaceSelect.innerHTML = options
+    .map((root) => {
+      if (roots.includes(root)) {
+        return `<option value="${esc(root)}">${esc(root)}</option>`;
+      }
+      const parent = roots.find((item) => workspaceUnderRoots(root, [item])) || "";
+      const label = parent ? root.slice(parent.length).replace(/^[\\/]+/, "") : root;
+      return `<option value="${esc(root)}">${esc(label)}（子目录）</option>`;
+    })
     .join("");
-  if (!roots.includes(state.workspace)) state.workspace = roots[0];
   workspaceSelect.value = state.workspace;
+  workspaceSelect.hidden = roots.length <= 1 && !custom;
 }
 
 function renderDeviceList() {
@@ -3207,17 +3312,18 @@ function renderDeviceList() {
   }
   list.innerHTML = state.devices
     .map(
-      (device) => `<div class="mcp-item">
+      (device) => `<div class="mcp-item${device.online ? "" : " offline"}">
         <div class="mcp-main">
           <div class="mcp-name">
             <b>${esc(device.name)}</b>
-            <span class="mcp-badge">${device.online ? "在线" : "离线"}</span>
+            <span class="mcp-badge ${device.online ? "on" : "off"}">${device.online ? "在线" : "离线"}</span>
             ${device.platform ? `<span class="mcp-badge">${esc(device.platform)}</span>` : ""}
           </div>
           <div class="mcp-meta">${(device.workspaces || []).length ? (device.workspaces || []).map((root) => esc(root)).join("<br>") : "尚未上报工作区"}</div>
           <div class="mcp-meta">${device.last_seen ? "最近连接：" + new Date(device.last_seen * 1000).toLocaleString("zh-CN") : "从未连接"}</div>
         </div>
         <div class="mcp-tools">
+          <button class="ghost" data-device-browse="${esc(device.id)}" type="button" ${device.online ? "" : "disabled"}>浏览</button>
           <button class="ghost" data-device-del="${esc(device.id)}" type="button">删除</button>
         </div>
       </div>`
@@ -3267,6 +3373,10 @@ async function deleteDevice(deviceId) {
   if (!ok) return;
   try {
     await api(`/api/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+    delete state.workspaceMap[deviceId];
+    try {
+      localStorage.setItem("ai_device_workspaces", JSON.stringify(state.workspaceMap));
+    } catch (err) { /* ignore quota errors */ }
     await loadDevices();
     renderDeviceList();
     toast("设备已删除");
@@ -3356,8 +3466,14 @@ function renderAccess() {
   const hint = $("accessHint");
   if (hint) {
     const dns = tailscale.dns_name || "";
+    const recItem = urls.find((item) => item.url === recommended);
+    const recKind = recItem ? recItem.kind : "";
     const lines = [];
-    if (!tailscale.installed) {
+    if (recKind === "public") {
+      lines.push("这是你当前访问的公网地址，手机用同一地址即可打开，不需要额外组网。");
+    } else if (recKind === "private" || recKind === "lan") {
+      lines.push("当前推荐的是局域网地址，手机需要连同一个 Wi-Fi 才能打开；跨网络时再考虑 Tailscale。");
+    } else if (!tailscale.installed) {
       lines.push("这台服务器还没装 Tailscale。装好后手机和电脑登录同一个 tailnet，就能用上面的地址互相访问，不需要开放公网端口。");
       lines.push("Windows / macOS：从 tailscale.com/download 安装并登录；Linux：<code>curl -fsSL https://tailscale.com/install.sh | sh</code> 然后 <code>sudo tailscale up</code>。");
     } else if (!tailscale.online) {
@@ -3365,9 +3481,9 @@ function renderAccess() {
       if (tailscale.error) lines.push(`状态信息：${esc(tailscale.error)}`);
     } else {
       lines.push("手机装 Tailscale 并登录同一个 tailnet，扫上面的二维码即可打开。首次需要输入 ACCESS_TOKEN。");
-      if (dns) {
-        lines.push(`想要 HTTPS 地址：在服务器上运行 <code>tailscale serve --bg ${data.port || 8000}</code>，然后访问 <code>https://${esc(dns)}</code>。不要用 Funnel，除非你确实想公开到公网。`);
-      }
+    }
+    if (tailscale.online && recKind !== "public" && dns) {
+      lines.push(`想要 HTTPS 地址：在服务器上运行 <code>tailscale serve --bg ${data.port || 8000}</code>，然后访问 <code>https://${esc(dns)}</code>。不要用 Funnel，除非你确实想公开到公网。`);
     }
     lines.push("手机只负责控制和审批；文件读写与命令执行仍由已配对的电脑 worker 完成。");
     if (recommended && /127\.0\.0\.1|localhost|\[::1\]/.test(recommended)) {
@@ -3401,6 +3517,120 @@ function renderAccess() {
       tokenState.textContent = "读取访问设置中…";
     }
   }
+}
+
+function relativeToRoot(path, root) {
+  const value = String(path || "");
+  const base = String(root || "");
+  if (!base || value.slice(0, base.length).toLowerCase() !== base.toLowerCase()) {
+    return "";
+  }
+  return value.slice(base.length).replace(/^[\\/]+/, "");
+}
+
+function closeWorkspaceBrowser() {
+  $("workspaceModal").hidden = true;
+  state.browse = null;
+}
+
+function openWorkspaceBrowser(deviceId) {
+  const targetId = deviceId || state.deviceId;
+  const device = state.devices.find((item) => item.id === targetId);
+  if (!device) { toast("先选择一台设备"); return; }
+  if (!device.online) { toast("设备离线，无法浏览目录"); return; }
+  const roots = device.workspaces || [];
+  if (!roots.length) { toast("设备还没有上报工作区"); return; }
+  if (targetId !== state.deviceId) {
+    state.deviceId = targetId;
+    localStorage.setItem("ai_device_id", targetId);
+    state.workspace = restoreWorkspaceFor(device);
+    renderDeviceSelect();
+  }
+  const root = roots.find((item) => workspaceUnderRoots(state.workspace, [item])) || roots[0];
+  let start = ".";
+  const relative = relativeToRoot(state.workspace, root);
+  if (relative) start = relative.split(/[\\/]+/).filter(Boolean).join("/");
+  state.browse = {
+    deviceId: device.id,
+    workspace: root,
+    path: start,
+    parent: "",
+    absolute: state.workspace || root,
+  };
+  $("workspaceModal").hidden = false;
+  loadBrowse(start);
+}
+
+async function loadBrowse(path) {
+  const browse = state.browse;
+  if (!browse) return;
+  const list = $("workspaceList");
+  const status = $("workspaceStatus");
+  status.className = "workspace-status";
+  status.textContent = "读取中…";
+  list.innerHTML = `<div class="workspace-empty">读取中…</div>`;
+  $("workspaceUse").disabled = true;
+  try {
+    const query =
+      `workspace=${encodeURIComponent(browse.workspace)}` +
+      `&path=${encodeURIComponent(path || ".")}`;
+    const data = await api(
+      `/api/devices/${encodeURIComponent(browse.deviceId)}/browse?${query}`
+    );
+    browse.path = data.path || ".";
+    browse.parent = data.parent || "";
+    browse.absolute = data.absolute || browse.workspace;
+    renderBrowse(data);
+  } catch (err) {
+    status.className = "workspace-status err";
+    status.textContent = "读取失败：" + err.message;
+    list.innerHTML = `<div class="workspace-empty">${esc(err.message)}</div>`;
+  }
+}
+
+function renderBrowse(data) {
+  const browse = state.browse;
+  if (!browse) return;
+  const segments =
+    browse.path && browse.path !== "." ? browse.path.split("/").filter(Boolean) : [];
+  const crumbs = [`<span class="crumb" data-path=".">${esc(browse.workspace)}</span>`];
+  const acc = [];
+  segments.forEach((segment) => {
+    acc.push(segment);
+    crumbs.push(
+      `<span class="crumb" data-path="${esc(acc.join("/"))}">${esc(segment)}</span>`
+    );
+  });
+  $("workspaceCrumbs").innerHTML = crumbs.join(
+    `<span class="crumb-sep"> / </span>`
+  );
+  const status = $("workspaceStatus");
+  status.className = "workspace-status";
+  status.textContent = data.absolute || browse.workspace;
+
+  const entries = data.entries || [];
+  $("workspaceList").innerHTML = entries.length
+    ? entries
+        .map(
+          (entry) =>
+            `<div class="workspace-row" data-path="${esc(entry.path)}"><span class="ico">▸</span><span>${esc(entry.name)}</span></div>`
+        )
+        .join("")
+    : `<div class="workspace-empty">${
+        browse.path === "." ? "这个工作区没有子目录" : "这里没有子目录"
+      }</div>`;
+  $("workspaceUp").disabled = segments.length === 0;
+  $("workspaceUse").disabled = false;
+}
+
+function useBrowsedWorkspace() {
+  const browse = state.browse;
+  if (!browse || !browse.absolute) return;
+  state.workspace = browse.absolute;
+  saveWorkspaceChoice(state.deviceId, state.workspace);
+  renderDeviceSelect();
+  closeWorkspaceBrowser();
+  toast("工作区已设为 " + state.workspace);
 }
 
 function updateClusterUI() {
@@ -4766,14 +4996,32 @@ function bindUI() {
   $("deleteRunBtn").onclick = deleteCurrentRun;
   $("deviceSelect").onchange = (e) => {
     state.deviceId = e.target.value;
-    state.workspace = "";
     localStorage.setItem("ai_device_id", state.deviceId);
-    localStorage.setItem("ai_workspace", "");
+    const device = selectedDevice();
+    state.workspace = device ? restoreWorkspaceFor(device) : "";
+    if (state.workspace) localStorage.setItem("ai_workspace", state.workspace);
     renderDeviceSelect();
   };
   $("workspaceSelect").onchange = (e) => {
     state.workspace = e.target.value;
-    localStorage.setItem("ai_workspace", state.workspace);
+    saveWorkspaceChoice(state.deviceId, state.workspace);
+    renderDeviceSelect();
+  };
+  $("workspaceBrowse").onclick = () => openWorkspaceBrowser();
+  $("workspaceClose").onclick = closeWorkspaceBrowser;
+  $("workspaceUse").onclick = useBrowsedWorkspace;
+  $("workspaceUp").onclick = () => {
+    const browse = state.browse;
+    if (!browse) return;
+    loadBrowse(browse.path && browse.path !== "." ? browse.parent || "." : ".");
+  };
+  $("workspaceList").onclick = (e) => {
+    const row = e.target.closest(".workspace-row[data-path]");
+    if (row) loadBrowse(row.dataset.path);
+  };
+  $("workspaceCrumbs").onclick = (e) => {
+    const crumb = e.target.closest(".crumb[data-path]");
+    if (crumb) loadBrowse(crumb.dataset.path || ".");
   };
   $("clusterSelect").onchange = (e) => {
     state.clusterId = e.target.value;
@@ -4812,6 +5060,11 @@ function bindUI() {
   $("devicePairCreate").onclick = createDevice;
   $("devicePairCopy").onclick = () => copyText(state.pendingDeviceCommand);
   $("deviceList").onclick = (e) => {
+    const browse = e.target.closest("button[data-device-browse]");
+    if (browse) {
+      openWorkspaceBrowser(browse.dataset.deviceBrowse);
+      return;
+    }
     const button = e.target.closest("button[data-device-del]");
     if (button) deleteDevice(button.dataset.deviceDel);
   };
@@ -4945,6 +5198,7 @@ function bindUI() {
 async function init() {
   bindUI();
   syncTokenCookie();
+  state.workspaceMap = loadWorkspaceMap();
   state.baseTitle = document.title;
   $("historySection").classList.toggle("collapsed", state.historyCollapsed);
   $("thinkingPanel").classList.toggle("collapsed", !state.thinkingOpen);

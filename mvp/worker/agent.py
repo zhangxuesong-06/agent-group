@@ -48,7 +48,8 @@ class Worker:
             root = Path(workspace).expanduser().resolve()
         except OSError as exc:
             raise WorkspaceError(f"无效工作区: {exc}") from exc
-        if root not in self.roots:
+        # A workspace may be a subdirectory of an authorized root.
+        if not any(root == item or root.is_relative_to(item) for item in self.roots):
             raise WorkspaceError("工作区未授权")
         candidate = Path(relative)
         target = (
@@ -89,33 +90,39 @@ class Worker:
         except (TypeError, ValueError):
             depth = 2
         depth = max(1, min(depth, 4))
+        dirs_only = bool(args.get("dirs_only"))
         entries: list[dict[str, Any]] = []
         truncated = False
-        for path in sorted(target.rglob("*")):
+        # Bounded breadth-first walk. `rglob` would traverse (and sort) the whole
+        # tree before the 400-entry cap applies, which is slow on big workspaces.
+        frontier: list[tuple[Path, int]] = [(target, 1)]
+        while frontier and not truncated:
+            current, level = frontier.pop(0)
             try:
-                rel = path.relative_to(target)
-            except ValueError:
+                children = sorted(current.iterdir(), key=lambda item: item.name.lower())
+            except OSError:
                 continue
-            if len(rel.parts) > depth:
-                continue
-            if path.is_dir():
-                entries.append(
-                    {
-                        "path": self.relative(root, path) + "/",
-                        "type": "dir",
-                    }
-                )
-            elif path.is_file():
-                entries.append(
-                    {
-                        "path": self.relative(root, path),
-                        "type": "file",
-                        "size": path.stat().st_size,
-                    }
-                )
-            if len(entries) >= 400:
-                truncated = True
-                break
+            for path in children:
+                if path.is_dir():
+                    entries.append(
+                        {
+                            "path": self.relative(root, path) + "/",
+                            "type": "dir",
+                        }
+                    )
+                    if level < depth:
+                        frontier.append((path, level + 1))
+                elif path.is_file() and not dirs_only:
+                    entries.append(
+                        {
+                            "path": self.relative(root, path),
+                            "type": "file",
+                            "size": path.stat().st_size,
+                        }
+                    )
+                if len(entries) >= 400:
+                    truncated = True
+                    break
         return {
             "path": self.relative(root, target),
             "workspace": str(root),

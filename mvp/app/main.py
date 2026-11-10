@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import io
 import json
+import re
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -566,6 +567,122 @@ async def delete_device(device_id: str) -> dict:
     return {"deleted": True}
 
 
+def _norm_path(path: str) -> str:
+    """Lexically normalize a path for cross-OS containment checks.
+
+    Server and worker may run different operating systems (cloud Linux + Windows
+    PC), so we cannot use pathlib here. The worker still enforces the real path.
+    """
+    raw = str(path or "").strip().replace("\\", "/")
+    drive = ""
+    if re.match(r"^[a-zA-Z]:", raw):
+        drive = raw[:2].lower()
+        raw = raw[2:]
+    absolute = raw.startswith("/")
+    parts: list[str] = []
+    for segment in raw.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    joined = "/".join(parts)
+    if drive:
+        value = f"{drive}/{joined}" if joined else f"{drive}/"
+    elif absolute:
+        value = "/" + joined
+    else:
+        value = joined
+    return value.lower()
+
+
+def _path_within(path: str, root: str) -> bool:
+    if not str(root or "").strip():
+        return False
+    child = _norm_path(path)
+    base = _norm_path(root).rstrip("/")
+    return bool(child) and (child == base or child.startswith(base + "/"))
+
+
+def _join_relative(base: str, relative: str) -> str:
+    """Join a device-style root with a posix-style relative path."""
+    rel = str(relative or ".").replace("\\", "/").strip("/")
+    if rel in ("", "."):
+        return str(base)
+    parts = []
+    for segment in rel.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    if not parts:
+        return str(base)
+    separator = "\\" if ("\\" in str(base) or re.match(r"^[a-zA-Z]:", str(base))) else "/"
+    return str(base).rstrip("\\/") + separator + separator.join(parts)
+
+
+@app.get("/api/devices/{device_id}/browse")
+async def browse_device(
+    device_id: str,
+    workspace: str = Query(min_length=1, max_length=1000),
+    path: str = Query(default=".", max_length=1000),
+) -> dict:
+    """List subdirectories of a device workspace without leaving the sandbox."""
+    record = store.get_device(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    roots = [str(item) for item in record.get("workspaces") or []]
+    base = str(workspace).strip()
+    if roots and not any(_path_within(base, root) for root in roots):
+        raise HTTPException(status_code=400, detail="工作区不在该设备的授权范围")
+    target = _join_relative(base, path)
+    if not _path_within(target, base):
+        raise HTTPException(status_code=400, detail="路径超出工作区")
+    if not device_hub.online(device_id):
+        raise HTTPException(status_code=409, detail="设备当前离线，无法浏览目录")
+    try:
+        result = await device_hub.call(
+            device_id,
+            "fs.list",
+            {"workspace": base, "path": path, "depth": 1, "dirs_only": True},
+            timeout=30.0,
+            wait=0,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        status = 400 if "WorkspaceError" in message else 409
+        raise HTTPException(
+            status_code=status, detail=message.replace("WorkspaceError: ", "")
+        ) from exc
+    entries = []
+    for item in result.get("entries") or []:
+        if item.get("type") != "dir":
+            continue
+        rel = str(item.get("path") or "").rstrip("/")
+        if not rel:
+            continue
+        entries.append({"name": rel.rsplit("/", 1)[-1], "path": rel})
+    entries.sort(key=lambda item: item["name"].lower())
+    current = str(result.get("path") or ".")
+    parent = ""
+    if current not in ("", "."):
+        parts = current.split("/")
+        parent = "/".join(parts[:-1])
+    return {
+        "workspace": base,
+        "path": current,
+        "parent": parent,
+        "absolute": target,
+        "entries": entries,
+        "truncated": bool(result.get("truncated")),
+    }
+
+
 @app.websocket("/api/worker/ws")
 async def worker_socket(websocket: WebSocket, token: str = Query(default="")) -> None:
     authorization = websocket.headers.get("authorization", "")
@@ -624,11 +741,19 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
         device_hub.detach(device_id, websocket)
 
 
+def _request_origin(request: Request) -> str:
+    """Best-effort public origin, including reverse-proxy forwarded headers."""
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    host = host or request.headers.get("host", "").strip()
+    if host:
+        return f"{proto or request.url.scheme}://{host}"
+    return str(request.base_url).rstrip("/")
+
+
 @app.get("/api/network")
 async def get_network(request: Request) -> dict:
-    return network_info(
-        settings.port, str(request.base_url).rstrip("/")
-    )
+    return network_info(settings.port, _request_origin(request))
 
 
 @app.get("/api/network/qr")
@@ -854,14 +979,14 @@ async def create_run(body: CreateRunRequest) -> dict:
         if not device_hub.online(record["id"]):
             raise HTTPException(status_code=409, detail="目标设备当前不在线")
         workspace = (body.workspace or "").strip()
+        roots = record.get("workspaces") or []
         if not workspace:
-            roots = record.get("workspaces") or []
             if not roots:
                 raise HTTPException(
                     status_code=400, detail="设备尚未上报可用工作区"
                 )
             workspace = roots[0]
-        if workspace not in (record.get("workspaces") or []):
+        if not any(_path_within(workspace, root) for root in roots):
             raise HTTPException(
                 status_code=400, detail="该工作区不在设备授权列表中"
             )
@@ -1004,7 +1129,10 @@ async def rerun(run_id: str) -> dict:
         record = store.get_device(device.get("id", ""))
         if record is None or not device_hub.online(record["id"]):
             raise HTTPException(status_code=409, detail="原设备当前不在线")
-        if device.get("workspace") not in (record.get("workspaces") or []):
+        if not any(
+            _path_within(device.get("workspace") or "", root)
+            for root in (record.get("workspaces") or [])
+        ):
             raise HTTPException(status_code=400, detail="原设备工作区已失效")
     if cluster.get("id"):
         try:

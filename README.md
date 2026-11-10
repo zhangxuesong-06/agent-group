@@ -411,6 +411,8 @@ LLM_MODEL=gpt-4o-mini
 - 公网 HTTPS：Cloudflare Tunnel，务必同时设置 `ACCESS_TOKEN`
 - 7×24 云端：`docker compose --env-file deploy/.env.cloud -f docker-compose.cloud.yml up -d --build`（Caddy 自动 HTTPS）
 - **云端 + 远程工作区**：设置 → 设备里配对 token，在每台电脑上运行 `mvp.worker.agent`；设备主动外连服务器。网页里选择在线设备和工作区后，文件/命令工具会在该设备执行
+  - 可以点「浏览…」逐级查看设备目录，选子目录作为 workspace
+  - 每台设备的选择会单独记住，下次自动恢复
   - 服务器只暴露 80/443
   - 每台设备一个独立 token，按 workspace 根目录授权
   - 设备离线时不能创建新任务；运行中掉线会报工具错误，重新上线后可继续

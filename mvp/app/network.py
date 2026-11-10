@@ -5,8 +5,10 @@ import shutil
 import socket
 import subprocess
 import time
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 _CACHE: tuple[float, dict[str, Any]] | None = None
 _CACHE_TTL = 10.0
@@ -97,6 +99,25 @@ def _lan_ips() -> list[str]:
     return sorted(ip for ip in ips if not ip.startswith("127."))
 
 
+def _origin_kind(origin: str) -> str:
+    """Classify the origin the browser used: public / private / loopback."""
+    try:
+        host = (urlsplit(origin).hostname or "").strip()
+    except ValueError:
+        return "public"
+    if not host or host.lower() == "localhost":
+        return "loopback" if host else "public"
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        return "public"  # a domain name
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_private or ip.is_link_local:
+        return "private"
+    return "public"
+
+
 def network_info(port: int, current_origin: str = "") -> dict[str, Any]:
     global _CACHE
     now = time.time()
@@ -112,46 +133,46 @@ def network_info(port: int, current_origin: str = "") -> dict[str, Any]:
         base = dict(base)
 
     tailscale = dict(base["tailscale"])
+    current_kind = _origin_kind(current_origin) if current_origin else ""
     urls: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(label: str, url: str, kind: str) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        urls.append({"label": label, "url": url, "kind": kind})
+
+    if current_origin:
+        add("当前访问地址", current_origin, current_kind or "current")
     for ip in tailscale.get("ips") or []:
-        urls.append(
-            {
-                "label": "Tailscale",
-                "url": f"http://{ip}:{port}",
-                "kind": "tailscale",
-            }
-        )
+        add("Tailscale", f"http://{ip}:{port}", "tailscale")
     dns_name = tailscale.get("dns_name") or ""
     if dns_name:
-        urls.append(
-            {
-                "label": "Tailscale HTTPS",
-                "url": f"https://{dns_name}",
-                "kind": "tailscale-https",
-            }
-        )
-    if current_origin:
-        urls.append(
-            {"label": "当前访问地址", "url": current_origin, "kind": "current"}
-        )
+        add("Tailscale HTTPS", f"https://{dns_name}", "tailscale-https")
     for ip in base["lan_ips"]:
-        urls.append({"label": "局域网", "url": f"http://{ip}:{port}", "kind": "lan"})
+        add("局域网", f"http://{ip}:{port}", "lan")
+
     recommended = ""
-    for candidate in urls:
-        if candidate["kind"] == "tailscale":
-            recommended = candidate["url"]
-            break
+    # 1) Public origin (cloud domain / public IP): that is what the user
+    #    actually opened, so it is the best address to hand to a phone.
+    if current_origin and current_kind == "public":
+        recommended = current_origin
+    # 2) Tailscale works across networks, so prefer it over LAN.
+    if not recommended:
+        for candidate in urls:
+            if candidate["kind"] == "tailscale":
+                recommended = candidate["url"]
+                break
+    # 3) Current LAN origin, then any detected LAN address.
+    if not recommended and current_origin and current_kind == "private":
+        recommended = current_origin
     if not recommended:
         for candidate in urls:
             if candidate["kind"] == "lan":
                 recommended = candidate["url"]
                 break
-    if not recommended and current_origin:
-        if not any(
-            host in current_origin
-            for host in ("127.0.0.1", "localhost", "[::1]")
-        ):
-            recommended = current_origin
+    # 4) Last resort: loopback (local testing only).
     if not recommended:
         recommended = current_origin or (urls[0]["url"] if urls else "")
     return {
