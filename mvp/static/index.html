@@ -853,6 +853,11 @@
   }
   .access-token.ok { color: var(--ok); border-color: #1d5c46; background: #0b1f19; }
   .access-token.warn { color: #fca5a5; border-color: #7f1d1d; background: #2a0f12; }
+  .access-sessions { margin-top: 16px; }
+  .access-sessions .form-actions { justify-content: flex-start; margin-top: 10px; }
+  .session-main { min-width: 0; flex: 1; }
+  .session-name { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .session-meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
   /* mobile */
   @media (max-width: 760px) {
@@ -906,10 +911,10 @@
 </div>
 <div class="modal" id="tokenModal" hidden>
   <div class="modal-card">
-    <h3>需要访问令牌</h3>
-    <p>这个集群开启了 <code>ACCESS_TOKEN</code>。请输入部署时设置的令牌，令牌只保存在当前浏览器的 localStorage 中。</p>
+    <h3>登录这台设备</h3>
+    <p>输入服务器 <code>mvp/.env</code> 里的 <code>ACCESS_TOKEN</code>。登录一次后，这台设备会保持登录，直到你主动退出或在设置里撤销。</p>
     <input id="tokenInput" type="password" placeholder="ACCESS_TOKEN" autocomplete="current-password" />
-    <button id="tokenSave">进入控制台</button>
+    <button id="tokenSave">登录</button>
     <div class="modal-error" id="tokenError"></div>
   </div>
 </div>
@@ -1136,6 +1141,16 @@
           <li>回到聊天页，底部输入框选择这台设备，正常发任务。</li>
         </ol>
         <div class="access-token" id="accessTokenState"></div>
+      </div>
+      <div class="access-sessions">
+        <div class="provider-list-head">
+          <span>已登录设备</span>
+          <button class="ghost" id="sessionRevokeOthers" type="button">撤销其他设备</button>
+        </div>
+        <div id="sessionList"></div>
+        <div class="form-actions">
+          <button class="ghost" id="logoutBtn" type="button">退出这台设备</button>
+        </div>
       </div>
       <div class="access-worker">
         <div class="access-label">远程电脑的 worker 命令</div>
@@ -1421,7 +1436,8 @@ const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "ai_cluster_token";
 const state = {
   meta: null, runId: null, run: null, tasks: [], es: null, logCount: 0,
-  token: localStorage.getItem(TOKEN_KEY) || "", poll: null,
+  authenticated: false, session: null, sessions: [], poll: null,
+  backgroundStarted: false,
   streamLive: false,
   batchId: null, batchRunning: false,
   activeRuns: 0,
@@ -1476,17 +1492,15 @@ function showConnError(message) {
 }
 function hideConnError() { $("connBanner").hidden = true; }
 
-function syncTokenCookie() {
-  if (state.token) {
-    document.cookie = "cluster_token=" + encodeURIComponent(state.token) + "; path=/; SameSite=Lax; max-age=2592000";
-  } else {
-    document.cookie = "cluster_token=; path=/; max-age=0; SameSite=Lax";
-  }
+function clearLegacyTokenCookie() {
+  document.cookie = "cluster_token=; path=/; max-age=0; SameSite=Lax";
 }
 
 async function api(path, opts = {}) {
-  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
-  if (state.token) headers.Authorization = "Bearer " + state.token;
+  const headers = Object.assign(
+    { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+    opts.headers || {}
+  );
   let r;
   try {
     r = await fetch(path, Object.assign({}, opts, { headers }));
@@ -1495,7 +1509,7 @@ async function api(path, opts = {}) {
     throw e;
   }
   if (r.status === 401) {
-    showTokenModal("令牌不正确，请重试");
+    showTokenModal("请先登录这台设备");
     throw new Error("unauthorized");
   }
   if (!r.ok) {
@@ -1869,9 +1883,7 @@ function cancelMessageEdit() {
 
 /* ----------------------------- conversation stream ----------------------------- */
 function chatHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (state.token) headers.Authorization = "Bearer " + state.token;
-  return headers;
+  return { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" };
 }
 
 function addPendingUser(content) {
@@ -2652,6 +2664,7 @@ function setSettingsTab(name) {
   }
   if (name === "access") {
     loadNetwork();
+    loadSessions();
   }
   if (name === "clusters") {
     loadClusters().then(() => renderClusterList()).catch(() => {});
@@ -3409,8 +3422,7 @@ async function renderAccessQr(url) {
     return;
   }
   try {
-    const headers = {};
-    if (state.token) headers.Authorization = "Bearer " + state.token;
+    const headers = { "X-Requested-With": "XMLHttpRequest" };
     const res = await fetch("/api/network/qr?url=" + encodeURIComponent(url), { headers });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const blob = await res.blob();
@@ -3507,7 +3519,7 @@ function renderAccess() {
   if (tokenState) {
     if (state.meta && state.meta.auth_required) {
       tokenState.className = "access-token ok";
-      tokenState.textContent = "ACCESS_TOKEN 已启用，手机打开时需要输入一次。";
+      tokenState.textContent = "每台新设备第一次打开时输入一次 ACCESS_TOKEN；之后保持登录，可在下方撤销。";
     } else if (state.meta) {
       tokenState.className = "access-token warn";
       tokenState.textContent =
@@ -4352,7 +4364,6 @@ function stopApprovalAlert() {
 
 async function pollApprovals() {
   if (!state.meta) return;
-  if (state.meta.auth_required && !state.token) return;
   if (state.confirmResolver) return;
   const active =
     (state.run && !TERMINAL.has(state.run.status)) || state.activeRuns > 0;
@@ -4891,7 +4902,7 @@ function renderMeta() {
     ? "mock"
     : (state.meta.provider ? state.meta.provider.name : state.meta.model);
   $("providerBadge").textContent = providerName;
-  const auth = state.meta.auth_required ? "🔒 令牌保护" : "⚠ 未启用鉴权";
+  const auth = state.authenticated ? "🔒 已登录" : "⚠ 未登录";
   const routed = state.meta.models ? state.meta.models.length : 0;
   const mcp = state.meta.mcp;
   const mcpText = mcp && mcp.tool_count ? ` · MCP ${mcp.tool_count} 工具` : "";
@@ -4928,8 +4939,8 @@ async function loadMetaAndRuns() {
     renderMeta();
   } catch (err) {
     if (err.message === "unauthorized") {
-      $("sideFoot").textContent = "需要访问令牌";
-      showTokenModal("");
+      $("sideFoot").textContent = "需要登录";
+      showTokenModal("请先登录这台设备");
     } else {
       $("sideFoot").textContent = "无法连接后端";
       showConnError("无法加载 /api/meta");
@@ -4941,24 +4952,160 @@ async function loadMetaAndRuns() {
   await loadClusters().catch(() => {});
 }
 
+async function loginWithToken(value) {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+    body: JSON.stringify({ token: value }),
+  });
+  let body = {};
+  try { body = await response.json(); } catch (err) { /* ignore */ }
+  if (!response.ok) {
+    throw new Error(body.detail || "登录失败");
+  }
+  state.authenticated = true;
+  state.session = body.session || null;
+  return body;
+}
+
+async function tryLegacyLogin() {
+  const legacy = localStorage.getItem(TOKEN_KEY);
+  if (!legacy) return false;
+  try {
+    await loginWithToken(legacy);
+    localStorage.removeItem(TOKEN_KEY);
+    clearLegacyTokenCookie();
+    return true;
+  } catch (err) {
+    localStorage.removeItem(TOKEN_KEY);
+    clearLegacyTokenCookie();
+    return false;
+  }
+}
+
+async function ensureAuth() {
+  try {
+    const info = await api("/api/auth/session");
+    if (info.authenticated) {
+      state.authenticated = true;
+      state.session = info.session || null;
+      return true;
+    }
+  } catch (err) { /* ignore */ }
+  if (await tryLegacyLogin()) return true;
+  showTokenModal("输入 ACCESS_TOKEN 登录这台设备");
+  return false;
+}
+
 async function saveToken() {
   const value = $("tokenInput").value.trim();
   if (!value) { $("tokenError").textContent = "请输入令牌"; return; }
-  state.token = value;
+  $("tokenSave").disabled = true;
   try {
-    state.meta = await api("/api/meta");
-    localStorage.setItem(TOKEN_KEY, value);
-    syncTokenCookie();
+    await loginWithToken(value);
+    localStorage.removeItem(TOKEN_KEY);
+    clearLegacyTokenCookie();
     $("tokenModal").hidden = true;
     $("tokenError").textContent = "";
-    renderMeta();
-    await loadRuns();
+    $("tokenInput").value = "";
+    await loadMetaAndRuns();
+    await loadDevices();
+    startBackground();
     if (state.runId) openStream(state.runId, 0);
+    toast("已登录这台设备");
   } catch (err) {
-    state.token = "";
-    localStorage.removeItem(TOKEN_KEY);
-    $("tokenError").textContent = "令牌不正确，请重试";
+    $("tokenError").textContent = err.message || "登录失败";
+  } finally {
+    $("tokenSave").disabled = false;
   }
+}
+
+async function loadSessions() {
+  try {
+    const data = await api("/api/auth/sessions");
+    state.sessions = data.sessions || [];
+  } catch (err) {
+    state.sessions = [];
+  }
+  renderSessions();
+}
+
+function renderSessions() {
+  const list = $("sessionList");
+  if (!list) return;
+  if (!state.sessions.length) {
+    list.innerHTML = `<div class="workspace-empty">还不能读取已登录设备</div>`;
+    return;
+  }
+  list.innerHTML = state.sessions
+    .map(
+      (session) => `<div class="access-item">
+        <div class="session-main">
+          <div class="session-name">${esc(session.label)}
+            ${session.current ? `<span class="tag best">这台设备</span>` : ""}
+          </div>
+          <div class="session-meta">最近使用 ${fmtTime(session.last_seen)}${
+            session.created_at
+              ? " · 登录于 " + new Date(session.created_at * 1000).toLocaleDateString("zh-CN")
+              : ""
+          }</div>
+        </div>
+        ${
+          session.current
+            ? ""
+            : `<button class="ghost" data-session-revoke="${esc(session.id)}" type="button">撤销</button>`
+        }
+      </div>`
+    )
+    .join("");
+}
+
+async function revokeSession(sessionId) {
+  const ok = await showConfirm({
+    title: "撤销登录",
+    message: "撤销后，这台设备需要重新输入令牌才能访问。",
+    confirmText: "撤销",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/auth/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    await loadSessions();
+    toast("已撤销");
+  } catch (err) {
+    toast("撤销失败：" + err.message);
+  }
+}
+
+async function revokeOtherSessions() {
+  const ok = await showConfirm({
+    title: "撤销其他设备",
+    message: "除了当前这台设备，其他已登录设备都会被退出。",
+    confirmText: "全部撤销",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const data = await api("/api/auth/sessions/revoke-others", { method: "POST" });
+    await loadSessions();
+    toast(`已撤销 ${data.revoked || 0} 台设备`);
+  } catch (err) {
+    toast("撤销失败：" + err.message);
+  }
+}
+
+async function logoutDevice() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } catch (err) { /* already logged out */ }
+  localStorage.removeItem(TOKEN_KEY);
+  clearLegacyTokenCookie();
+  location.reload();
 }
 
 function bindUI() {
@@ -5070,6 +5217,12 @@ function bindUI() {
   };
   $("accessRefresh").onclick = () => loadNetwork(true);
   $("accessWorkerCopy").onclick = () => copyText(state.accessWorkerCommand);
+  $("logoutBtn").onclick = logoutDevice;
+  $("sessionRevokeOthers").onclick = revokeOtherSessions;
+  $("sessionList").onclick = (e) => {
+    const button = e.target.closest("button[data-session-revoke]");
+    if (button) revokeSession(button.dataset.sessionRevoke);
+  };
   $("historyToggle").onclick = () => {
     state.historyCollapsed = !state.historyCollapsed;
     localStorage.setItem("ai_history_collapsed", state.historyCollapsed ? "1" : "0");
@@ -5195,22 +5348,29 @@ function bindUI() {
   };
 }
 
-async function init() {
-  bindUI();
-  syncTokenCookie();
-  state.workspaceMap = loadWorkspaceMap();
-  state.baseTitle = document.title;
-  $("historySection").classList.toggle("collapsed", state.historyCollapsed);
-  $("thinkingPanel").classList.toggle("collapsed", !state.thinkingOpen);
-  renderToolbars();
-  await loadMetaAndRuns();
-  await loadDevices();
+function startBackground() {
+  if (state.backgroundStarted) return;
+  state.backgroundStarted = true;
   pollApprovals();
   setInterval(pollApprovals, 2000);
   setInterval(() => {
     if (state.activeRuns > 0) loadRuns().catch(() => {});
   }, 10000);
   setInterval(() => loadDevices().catch(() => {}), 15000);
+}
+
+async function init() {
+  bindUI();
+  clearLegacyTokenCookie();
+  state.workspaceMap = loadWorkspaceMap();
+  state.baseTitle = document.title;
+  $("historySection").classList.toggle("collapsed", state.historyCollapsed);
+  $("thinkingPanel").classList.toggle("collapsed", !state.thinkingOpen);
+  renderToolbars();
+  if (!(await ensureAuth())) return;
+  await loadMetaAndRuns();
+  await loadDevices();
+  startBackground();
 }
 init();
 </script>

@@ -86,6 +86,17 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    token_hash  TEXT NOT NULL UNIQUE,
+    label       TEXT NOT NULL DEFAULT '',
+    user_agent  TEXT NOT NULL DEFAULT '',
+    ip          TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    last_seen   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen DESC);
+
 CREATE TABLE IF NOT EXISTS clusters (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
@@ -575,6 +586,89 @@ class Store:
             item["workspaces"] = []
         item.pop("token_hash", None)
         return item
+
+    # ---------- controller sessions ----------
+
+    def create_session(
+        self,
+        token_hash: str,
+        label: str,
+        user_agent: str,
+        ip: str,
+        now: float,
+    ) -> dict[str, Any]:
+        session_id = new_id("sess")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sessions"
+                " (id, token_hash, label, user_agent, ip, created_at, last_seen)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (session_id, token_hash, label, user_agent, ip, now, now),
+            )
+            self._conn.commit()
+        return {
+            "id": session_id,
+            "label": label,
+            "created_at": now,
+            "last_seen": now,
+        }
+
+    def get_session(self, token_hash: str, ttl: float) -> dict[str, Any] | None:
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+            if row is None:
+                return None
+            if now - float(row["last_seen"]) > ttl:
+                self._conn.execute("DELETE FROM sessions WHERE id=?", (row["id"],))
+                self._conn.commit()
+                return None
+        item = dict(row)
+        item.pop("token_hash", None)
+        return item
+
+    def touch_session(self, session_id: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET last_seen=? WHERE id=? AND last_seen<?",
+                (now, session_id, now - 60),
+            )
+            self._conn.commit()
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, label, user_agent, ip, created_at, last_seen"
+                " FROM sessions ORDER BY last_seen DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM sessions WHERE id=?", (session_id,)
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def delete_other_sessions(self, keep_id: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM sessions WHERE id<>?", (keep_id,)
+            )
+            self._conn.commit()
+        return cursor.rowcount
+
+    def purge_sessions(self, ttl: float) -> int:
+        cutoff = time.time() - ttl
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM sessions WHERE last_seen<?", (cutoff,)
+            )
+            self._conn.commit()
+        return cursor.rowcount
 
     # ---------- clusters ----------
 

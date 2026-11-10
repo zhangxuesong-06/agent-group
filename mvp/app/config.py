@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,37 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _ensure_access_token(base_dir: Path) -> str:
+    """Authentication is mandatory: generate a token on first start."""
+    token = secrets.token_urlsafe(32)
+    env_path = base_dir / ".env"
+    try:
+        existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        if "ACCESS_TOKEN" in existing:
+            for line in existing.splitlines():
+                line = line.strip()
+                if line.startswith("ACCESS_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+            return token
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
+        with env_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{prefix}# generated on first start; keep it secret\n"
+                f"ACCESS_TOKEN={token}\n"
+            )
+        os.environ["ACCESS_TOKEN"] = token
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError:
+            pass
+        print(f"[auth] 未设置 ACCESS_TOKEN，已生成并写入 {env_path}")
+        print(f"[auth] 首次登录令牌：{token}")
+    except OSError as exc:
+        print(f"[auth] 警告：无法写入 {env_path}：{exc}")
+        print(f"[auth] 本次使用临时令牌，重启后会变化：{token}")
+    return token
+
+
 @dataclass
 class Settings:
     base_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
@@ -39,6 +71,9 @@ class Settings:
     port: int = field(default_factory=lambda: _env_int("PORT", 8000))
     # If set, every /api/* call (except health) needs this bearer token.
     access_token: str = field(default_factory=lambda: os.getenv("ACCESS_TOKEN", ""))
+    session_days: int = field(
+        default_factory=lambda: max(1, _env_int("SESSION_DAYS", 180))
+    )
     cors_origins: list[str] = field(
         default_factory=lambda: [
             o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
@@ -97,6 +132,8 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        if not self.access_token:
+            self.access_token = _ensure_access_token(self.base_dir)
 
     @property
     def mock_mode(self) -> bool:

@@ -118,6 +118,11 @@ class ApprovalInput(BaseModel):
     scope: Literal["once", "run"] = "once"
 
 
+class LoginInput(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+    label: str = Field(default="", max_length=60)
+
+
 class MCPServerInput(BaseModel):
     id: str | None = Field(default=None, max_length=80)
     name: str = Field(default="", max_length=80)

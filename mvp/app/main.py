@@ -5,12 +5,12 @@ import hmac
 import io
 import json
 import re
+import secrets
 import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
-from urllib.parse import unquote
 
 from fastapi import (
     FastAPI,
@@ -48,6 +48,7 @@ from .models import (
     ClusterInput,
     CreateRunRequest,
     DeviceInput,
+    LoginInput,
     MessageInput,
     MCPServerInput,
     ProviderEnabledInput,
@@ -126,6 +127,10 @@ STATIC_DIR = settings.base_dir / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
+        store.purge_sessions(settings.session_days * 86400)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         await mcp_manager.start_enabled()
     except Exception:  # noqa: BLE001 - MCP errors must not block the web UI
         pass
@@ -158,30 +163,225 @@ app.add_middleware(
 )
 
 
+SESSION_COOKIE = "cluster_session"
+LOGIN_WINDOW = 15 * 60
+LOGIN_MAX_FAILURES = 5
+_login_failures: dict[str, list[float]] = {}
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/session",
+    "/api/auth/logout",
+}
+
+
+def _client_key(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _ua_label(user_agent: str) -> str:
+    ua = user_agent or ""
+    if "Edg/" in ua:
+        browser = "Edge"
+    elif "OPR/" in ua:
+        browser = "Opera"
+    elif "Chrome/" in ua:
+        browser = "Chrome"
+    elif "Firefox/" in ua:
+        browser = "Firefox"
+    elif "Safari/" in ua:
+        browser = "Safari"
+    else:
+        browser = "浏览器"
+    if "iPhone" in ua:
+        system = "iPhone"
+    elif "iPad" in ua:
+        system = "iPad"
+    elif "Android" in ua:
+        system = "Android"
+    elif "Windows" in ua:
+        system = "Windows"
+    elif "Macintosh" in ua:
+        system = "macOS"
+    elif "Linux" in ua:
+        system = "Linux"
+    else:
+        system = "未知系统"
+    return f"{browser} · {system}"
+
+
+def _is_secure_request(request: Request) -> bool:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
+def _set_session_cookie(response: Response, secret: str, request: Request) -> Response:
+    response.set_cookie(
+        SESSION_COOKIE,
+        secret,
+        max_age=settings.session_days * 86400,
+        httponly=True,
+        samesite="strict",
+        secure=_is_secure_request(request),
+        path="/",
+    )
+    return response
+
+
+def _clear_session_cookie(response: Response) -> Response:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+def _session_from_request(request: Request) -> dict | None:
+    secret = request.cookies.get(SESSION_COOKIE, "")
+    if not secret:
+        return None
+    session = store.get_session(
+        hash_worker_token(secret), settings.session_days * 86400
+    )
+    if session is not None:
+        store.touch_session(session["id"], time.time())
+    return session
+
+
+def _login_retry_after(key: str) -> float:
+    now = time.time()
+    recent = [item for item in _login_failures.get(key, []) if now - item < LOGIN_WINDOW]
+    if recent:
+        _login_failures[key] = recent
+    else:
+        _login_failures.pop(key, None)
+    if len(recent) >= LOGIN_MAX_FAILURES:
+        return max(1.0, LOGIN_WINDOW - (now - recent[0]))
+    return 0.0
+
+
 @app.middleware("http")
-async def require_access_token(request: Request, call_next):
-    """Optional bearer-token gate. Disabled when ACCESS_TOKEN is empty."""
-    token = settings.access_token
+async def require_auth(request: Request, call_next):
+    """Every /api route requires a login session or the server token."""
     path = request.url.path
-    if (
-        not token
-        or not path.startswith("/api")
-        or path == "/api/health"
-        or request.method == "OPTIONS"
-    ):
+    if request.method == "OPTIONS" or not path.startswith("/api"):
+        return await call_next(request)
+    if path in PUBLIC_API_PATHS:
         return await call_next(request)
 
-    supplied = ""
     header = request.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
         supplied = header[7:].strip()
-    if not supplied:
-        supplied = unquote(request.cookies.get("cluster_token", ""))
-    if not supplied:
-        supplied = request.query_params.get("token", "")
-    if not hmac.compare_digest(supplied, token):
+        if hmac.compare_digest(supplied, settings.access_token):
+            request.state.auth = {"kind": "token"}
+            return await call_next(request)
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
+    session = _session_from_request(request)
+    if session is None:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if request.headers.get("x-requested-with") != "XMLHttpRequest":
+            return JSONResponse({"detail": "missing csrf header"}, status_code=403)
+    request.state.auth = {
+        "kind": "session",
+        "id": session["id"],
+        "label": session.get("label", ""),
+    }
     return await call_next(request)
+
+
+@app.post("/api/auth/login")
+async def login(body: LoginInput, request: Request) -> Response:
+    key = _client_key(request)
+    retry = _login_retry_after(key)
+    if retry > 0:
+        raise HTTPException(
+            status_code=429, detail=f"尝试过多，请 {int(retry)} 秒后再试"
+        )
+    supplied = body.token.strip()
+    if not supplied or not hmac.compare_digest(supplied, settings.access_token):
+        _login_failures.setdefault(key, []).append(time.time())
+        raise HTTPException(status_code=401, detail="令牌不正确")
+    _login_failures.pop(key, None)
+    secret = secrets.token_urlsafe(32)
+    user_agent = request.headers.get("user-agent", "")
+    label = body.label.strip() or _ua_label(user_agent)
+    session = store.create_session(
+        hash_worker_token(secret),
+        label,
+        user_agent[:300],
+        key,
+        time.time(),
+    )
+    payload = {
+        "authenticated": True,
+        "session": {"id": session["id"], "label": session["label"]},
+        "expires_in_days": settings.session_days,
+    }
+    return _set_session_cookie(JSONResponse(payload), secret, request)
+
+
+@app.get("/api/auth/session")
+async def auth_session(request: Request) -> dict:
+    session = _session_from_request(request)
+    if session is None:
+        return {"authenticated": False, "expires_in_days": settings.session_days}
+    return {
+        "authenticated": True,
+        "session": {
+            "id": session["id"],
+            "label": session.get("label", ""),
+            "created_at": session.get("created_at"),
+            "last_seen": session.get("last_seen"),
+        },
+        "expires_in_days": settings.session_days,
+    }
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request) -> Response:
+    session = _session_from_request(request)
+    if session is not None:
+        store.delete_session(session["id"])
+    return _clear_session_cookie(JSONResponse({"authenticated": False}))
+
+
+@app.get("/api/auth/sessions")
+async def auth_sessions(request: Request) -> dict:
+    auth = getattr(request.state, "auth", {})
+    current_id = auth.get("id") if auth.get("kind") == "session" else ""
+    sessions = [
+        {
+            "id": item["id"],
+            "label": item["label"] or "未知设备",
+            "created_at": item["created_at"],
+            "last_seen": item["last_seen"],
+            "current": item["id"] == current_id,
+        }
+        for item in store.list_sessions()
+    ]
+    return {"sessions": sessions, "current": current_id}
+
+
+@app.delete("/api/auth/sessions/{session_id}")
+async def revoke_session(session_id: str, request: Request) -> Response:
+    auth = getattr(request.state, "auth", {})
+    if auth.get("kind") != "session":
+        raise HTTPException(status_code=400, detail="令牌鉴权下不能管理会话")
+    store.delete_session(session_id)
+    if session_id == auth.get("id"):
+        return _clear_session_cookie(JSONResponse({"revoked": True, "current": True}))
+    return JSONResponse({"revoked": True, "current": False})
+
+
+@app.post("/api/auth/sessions/revoke-others")
+async def revoke_other_sessions(request: Request) -> dict:
+    auth = getattr(request.state, "auth", {})
+    if auth.get("kind") != "session":
+        raise HTTPException(status_code=400, detail="令牌鉴权下不能管理会话")
+    count = store.delete_other_sessions(str(auth.get("id") or ""))
+    return {"revoked": count}
 
 
 # ----------------------------------------------------------------------

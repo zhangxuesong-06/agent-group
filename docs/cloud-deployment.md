@@ -146,9 +146,13 @@ python -m mvp.worker.agent \
 
 ## 5. 权限与安全
 
-- **必须设置 `ACCESS_TOKEN`**；为空时 API 对同网络所有人开放。
-- **必须用 HTTPS/WSS**；不要把 `8000` 直接暴露到公网。
-- 每台设备一个 token；泄露后在服务器删除该设备即可：
+- **控制面强制登录**：没有 `ACCESS_TOKEN` 时服务会自动生成一个写入 `mvp/.env` 并打印一次；任何 `/api` 调用都必须带有效会话或 Bearer token。
+- **每台设备登录一次**：手机/电脑首次打开输入 `ACCESS_TOKEN`，换取 HttpOnly 会话 cookie（默认 180 天，`SESSION_DAYS` 可调）；之后不用重复输入。
+- **会话可撤销**：设置 → 访问 里能看到已登录设备并单独撤销，也可以「撤销其他设备」或退出当前设备。
+- **登录限速**：同一 IP 连续失败 5 次锁 15 分钟。
+- **令牌泄露处理**：修改 `mvp/.env`（或云端环境变量）里的 `ACCESS_TOKEN` 并重启，阻止新登录；再到设置 → 访问撤销其他设备，清掉已有会话。
+- **必须用 HTTPS/WSS**；不要把 `8000` 直接暴露到公网。会话 cookie 在 HTTPS 下自动带 `Secure`。
+- 每台 worker 一个 token；泄露后在服务器删除该设备即可：
   ```bash
   curl -X DELETE https://cluster.example.com/api/devices/<device_id> \
     -H "Authorization: Bearer <ACCESS_TOKEN>"
@@ -162,7 +166,7 @@ python -m mvp.worker.agent \
 
 ## 6. 当前限制
 
-- 单用户单 `ACCESS_TOKEN`；多用户/RBAC 还没做。
+- 单用户；多用户/RBAC 还没做，但每台控制设备有独立会话，可以单独撤销。
 - 设备在线状态和 RPC 在单进程内存里；多副本部署需要 Redis/NATS 或数据库租约。
 - SQLite 适合单机/小规模；多用户或高并发建议迁移 PostgreSQL。
 - 任务运行中设备掉线时，服务器会等待设备重连（默认 60 秒，`DEVICE_WAIT_SEC` 可调）：

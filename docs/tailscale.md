@@ -132,7 +132,7 @@ sudo tailscale serve --bg off
 4. 打开网页地址，输入 `ACCESS_TOKEN`。
 5. 在底部输入框选择一台在线电脑作为执行设备。
 
-手机浏览器第一次输入 token 后会写入 cookie 和 localStorage，之后不用重复输入。
+手机浏览器第一次输入 token 后会换成登录会话（HttpOnly cookie），之后不用重复输入；丢失设备可以在「设置 → 访问」里撤销它的会话。
 
 ## 6. 让电脑 worker 用 Tailscale 地址连接
 
@@ -162,13 +162,15 @@ worker 是主动外连的，电脑不需要开放任何端口。
 
 ## 7. 安全建议
 
-### 一定要设置 ACCESS_TOKEN
+### 登录令牌
+
+首次启动会自动生成 `ACCESS_TOKEN` 写入 `mvp/.env`，并在终端打印一次。也可以自己指定：
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-不设 token 时，同一 tailnet 内任何人都能打开并操作这个集群。
+每台手机/电脑第一次打开时输入它；之后用会话登录，可在「设置 → 访问」里单独撤销。
 
 ### 不要启用 Funnel
 

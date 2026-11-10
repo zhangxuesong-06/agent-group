@@ -9,11 +9,29 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
-TOKEN = os.getenv("ACCESS_TOKEN", "")
+
+
+def _access_token() -> str:
+    token = os.getenv("ACCESS_TOKEN", "").strip()
+    if token:
+        return token
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("ACCESS_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+TOKEN = _access_token()
 GOAL = "用中文测试：调研 AI 集群，分析风险，给出方案"
 
 
