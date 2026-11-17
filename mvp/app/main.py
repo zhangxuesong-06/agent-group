@@ -248,6 +248,24 @@ def _session_from_request(request: Request) -> dict | None:
     return session
 
 
+def _token_ok(supplied: str, expected: str) -> bool:
+    """Compare tokens as UTF-8 bytes so non-ASCII input cannot raise."""
+    if not supplied or not expected:
+        return False
+    try:
+        return hmac.compare_digest(
+            supplied.encode("utf-8"), expected.encode("utf-8")
+        )
+    except (UnicodeError, TypeError):
+        return False
+
+
+def _bearer_ok(header: str, expected: str) -> bool:
+    if not header or not header.lower().startswith("bearer "):
+        return False
+    return _token_ok(header[7:].strip(), expected)
+
+
 def _login_retry_after(key: str) -> float:
     now = time.time()
     recent = [item for item in _login_failures.get(key, []) if now - item < LOGIN_WINDOW]
@@ -271,8 +289,7 @@ async def require_auth(request: Request, call_next):
 
     header = request.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
-        supplied = header[7:].strip()
-        if hmac.compare_digest(supplied, settings.access_token):
+        if _bearer_ok(header, settings.access_token):
             request.state.auth = {"kind": "token"}
             return await call_next(request)
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
@@ -300,7 +317,7 @@ async def login(body: LoginInput, request: Request) -> Response:
             status_code=429, detail=f"尝试过多，请 {int(retry)} 秒后再试"
         )
     supplied = body.token.strip()
-    if not supplied or not hmac.compare_digest(supplied, settings.access_token):
+    if not _token_ok(supplied, settings.access_token):
         _login_failures.setdefault(key, []).append(time.time())
         raise HTTPException(status_code=401, detail="令牌不正确")
     _login_failures.pop(key, None)
@@ -888,6 +905,9 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
     authorization = websocket.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    if not token.strip():
+        await websocket.close(code=4401, reason="invalid worker token")
+        return
     record = store.get_device_by_token_hash(hash_worker_token(token))
     if record is None:
         await websocket.close(code=4401, reason="invalid worker token")

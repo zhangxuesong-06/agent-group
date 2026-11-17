@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,30 +28,70 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _ensure_access_token(base_dir: Path) -> str:
-    """Authentication is mandatory: generate a token on first start."""
-    token = secrets.token_urlsafe(32)
+_ACCESS_TOKEN_LINE = re.compile(r"^\s*(?:export\s+)?ACCESS_TOKEN\s*=\s*(.*?)\s*$")
+
+
+def _parse_env_value(raw: str) -> str:
+    """Parse one .env value the same way python-dotenv does for our cases."""
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] in ("'", '"'):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return (value[1:end] if end != -1 else value[1:]).strip()
+    if " #" in value:
+        value = value.split(" #", 1)[0]
+    return value.strip()
+
+
+def _read_env_token(env_text: str) -> str:
+    """Return the last effective ACCESS_TOKEN= value, ignoring comments."""
+    token = ""
+    for line in env_text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        match = _ACCESS_TOKEN_LINE.match(line)
+        if not match:
+            continue
+        value = _parse_env_value(match.group(1))
+        # A value starting with '#' is a placeholder, not a credential.
+        token = "" if not value or value.startswith("#") else value
+    return token
+
+
+def _resolve_access_token(base_dir: Path) -> str:
+    """Authentication is mandatory: never return an empty token."""
     env_path = base_dir / ".env"
     try:
-        existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-        if "ACCESS_TOKEN" in existing:
-            for line in existing.splitlines():
-                line = line.strip()
-                if line.startswith("ACCESS_TOKEN="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-            return token
-        prefix = "" if not existing or existing.endswith("\n") else "\n"
-        with env_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"{prefix}# generated on first start; keep it secret\n"
-                f"ACCESS_TOKEN={token}\n"
-            )
+        existing = (
+            env_path.read_text(encoding="utf-8-sig", errors="replace")
+            if env_path.exists()
+            else ""
+        )
+    except OSError as exc:
+        print(f"[auth] 警告：无法读取 {env_path}：{exc}")
+        existing = ""
+
+    token = _read_env_token(existing)
+    if token:
+        return token
+
+    token = secrets.token_urlsafe(32)
+    kept = [
+        line for line in existing.splitlines() if not _ACCESS_TOKEN_LINE.match(line)
+    ]
+    if not any("generated on first start" in line for line in kept):
+        kept.append("# generated on first start; keep it secret")
+    kept.append(f"ACCESS_TOKEN={token}")
+    try:
+        env_path.write_text("\n".join(kept).rstrip("\n") + "\n", encoding="utf-8")
         os.environ["ACCESS_TOKEN"] = token
         try:
             os.chmod(env_path, 0o600)
         except OSError:
             pass
-        print(f"[auth] 未设置 ACCESS_TOKEN，已生成并写入 {env_path}")
+        print(f"[auth] ACCESS_TOKEN 未设置或为空，已生成并写入 {env_path}")
         print(f"[auth] 首次登录令牌：{token}")
     except OSError as exc:
         print(f"[auth] 警告：无法写入 {env_path}：{exc}")
@@ -132,8 +173,11 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        if not self.access_token.strip():
+            self.access_token = _resolve_access_token(self.base_dir)
+        self.access_token = self.access_token.strip()
         if not self.access_token:
-            self.access_token = _ensure_access_token(self.base_dir)
+            raise RuntimeError("ACCESS_TOKEN 不能为空；请在 mvp/.env 中设置有效令牌")
 
     @property
     def mock_mode(self) -> bool:

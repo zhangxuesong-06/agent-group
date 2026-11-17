@@ -48,8 +48,6 @@ def print_banner() -> None:
         for ip in lan_ips():
             print(f"  ├─ 局域网访问 http://{ip}:{port}")
         print("  └─ 其他设备请用上面的局域网地址（手机需与本机同一 Wi-Fi）")
-        if not settings.access_token:
-            print("  [!] 未设置 ACCESS_TOKEN：同一网络内任何人都能调用 API，建议设置后再对外开放")
     else:
         print(f"  └─ 监听地址   {host}:{port}（其他设备无法直接访问，改成 0.0.0.0 可开放）")
     if settings.access_token:

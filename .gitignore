@@ -8,6 +8,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 build/
 dist/
@@ -27,13 +29,31 @@ mvp/.env
 # Local runtime data
 mvp/data/
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
 *.log
 logs/
+*.pid
 test_result.json
+
+# Temporary files produced by the manual checks in HANDOVER §15
+mvp/static/_check.js
+
+# Local backups (HANDOVER §14.5)
+backup/
+backups/
+*.bak
+*.orig
+*.rej
+*.tmp
+*.temp
+*~
 
 # OS / editors
 .DS_Store
@@ -48,3 +68,6 @@ desktop.ini
 node_modules/
 npm-debug.log*
 yarn-error.log*
+
+# Superpowers scratch workspace
+.superpowers/
