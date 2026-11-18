@@ -112,6 +112,10 @@ class Settings:
     port: int = field(default_factory=lambda: _env_int("PORT", 8000))
     # If set, every /api/* call (except health) needs this bearer token.
     access_token: str = field(default_factory=lambda: os.getenv("ACCESS_TOKEN", ""))
+    enable_api_docs: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_API_DOCS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     session_days: int = field(
         default_factory=lambda: max(1, _env_int("SESSION_DAYS", 180))
     )

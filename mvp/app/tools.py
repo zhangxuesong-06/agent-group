@@ -9,12 +9,14 @@ import locale
 import operator
 import os
 import re
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
 
+import httpcore
 import httpx
 
 from .config import Settings
@@ -334,27 +336,195 @@ async def _web_search(args: dict[str, Any], ctx: dict[str, Any]) -> str:
     )
 
 
-async def _fetch_url(args: dict[str, Any], ctx: dict[str, Any]) -> str:
-    url = str(args.get("url", "")).strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("只允许 http/https URL")
-    host = parsed.hostname
+MAX_FETCH_BYTES = 1_048_576
+_FETCH_TIMEOUT = 15.0
+_BLOCKED_V6_NETWORKS = tuple(
+    ipaddress.ip_network(network) for network in ("2002::/16", "2001::/32", "64:ff9b::/96")
+)
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 6:
+        # Encapsulated IPv4 and NAT64 forms can hide a private destination.
+        if ip.ipv4_mapped or ip.sixtofour or ip.teredo:
+            return False
+        if any(ip in network for network in _BLOCKED_V6_NETWORKS):
+            return False
+    return bool(
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_reserved
+        and not ip.is_multicast
+        and not ip.is_unspecified
+    )
+
+
+def _parse_fetch_url(raw: str) -> httpx.URL:
+    text = str(raw or "").strip()
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError("禁止访问内网地址")
-    except ValueError as exc:
-        if "禁止" in str(exc):
-            raise
-    if host.lower() in ("localhost", "metadata.google.internal"):
+        url = httpx.URL(text)
+        port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    except Exception as exc:  # noqa: BLE001 - any parse failure means reject
+        raise ValueError("只允许 http/https URL") from exc
+    if url.scheme not in ("http", "https") or not url.host:
+        raise ValueError("只允许 http/https URL")
+    if url.userinfo:
+        raise ValueError("URL 不能包含用户名或密码")
+    if "%" in url.host:
+        raise ValueError("URL 不能包含 IPv6 scope id")
+    host = url.host.lower().rstrip(".")
+    if host in ("localhost", "metadata.google.internal") or host.endswith(".localhost"):
         raise ValueError("禁止访问内网地址")
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-        resp = await client.get(url, headers={"User-Agent": "ai-cluster-mvp/0.1"})
-    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", resp.text, flags=re.I)
+    if not 1 <= port <= 65535:
+        raise ValueError("URL 端口无效")
+    if url.host != host:
+        # Keep Host/SNI consistent when the input used case or a trailing dot.
+        url = url.copy_with(host=host)
+    return url
+
+
+async def _resolve_public_addresses(host: str, port: int) -> list[str]:
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=5.0
+        )
+    except (OSError, asyncio.TimeoutError) as exc:
+        raise ValueError(f"无法解析主机：{host}") from exc
+    addresses: list[str] = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError as exc:
+            raise ValueError(f"无法解析主机：{host}") from exc
+        if not _is_public_ip(ip):
+            raise ValueError("禁止访问内网地址")
+        if str(ip) not in addresses:
+            addresses.append(str(ip))
+    if not addresses:
+        raise ValueError(f"无法解析主机：{host}")
+    return addresses
+
+
+class _PublicNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Resolve once per connection and dial only the validated numeric IP."""
+
+    def __init__(self) -> None:
+        self._delegate = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        last_error: Exception | None = None
+        for address in await _resolve_public_addresses(host, port):
+            try:
+                return await self._delegate.connect_tcp(
+                    address, port, timeout, local_address, socket_options
+                )
+            except Exception as exc:  # noqa: BLE001 - try the next validated address
+                last_error = exc
+        raise httpcore.ConnectError(f"无法连接 {host}") from last_error
+
+    async def connect_unix_socket(
+        self, path: str, timeout: float | None = None, socket_options: Any = None
+    ) -> httpcore.AsyncNetworkStream:
+        raise httpcore.ConnectError("不允许使用 unix socket 抓取网页")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
+def _header_value(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
+    for key, value in headers:
+        if key.lower() == name:
+            return value
+    return None
+
+
+async def _read_limited_body(
+    response: httpcore.Response, limit: int = MAX_FETCH_BYTES
+) -> bytes:
+    encoding = (_header_value(response.headers, b"content-encoding") or b"").decode(
+        "latin-1"
+    ).strip().lower()
+    if encoding and encoding != "identity":
+        raise ValueError("不支持压缩响应")
+    declared = _header_value(response.headers, b"content-length")
+    if declared:
+        try:
+            length = int(declared)
+        except ValueError:
+            length = None
+        if length is not None and length > limit:
+            raise ValueError(f"响应超过 {limit} 字节上限")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_stream():
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"响应超过 {limit} 字节上限")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_body(body: bytes, content_type: str) -> str:
+    match = re.search(r"charset\s*=\s*['\"]?([\w-]+)", content_type or "", re.I)
+    charset = match.group(1) if match else "utf-8"
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+async def _fetch_url(args: dict[str, Any], ctx: dict[str, Any]) -> str:
+    url = _parse_fetch_url(str(args.get("url", "")))
+    headers = [
+        (b"Host", url.netloc),
+        (b"User-Agent", b"ai-cluster-mvp/0.1"),
+        (b"Accept", b"text/html,text/plain;q=0.9,*/*;q=0.5"),
+        (b"Accept-Encoding", b"identity"),
+    ]
+    try:
+        async with asyncio.timeout(_FETCH_TIMEOUT):
+            # Direct connections only: an environment proxy would dial the
+            # target itself and bypass the address checks above.
+            async with httpcore.AsyncConnectionPool(
+                network_backend=_PublicNetworkBackend(),
+                max_connections=1,
+                retries=0,
+            ) as pool:
+                async with pool.stream(
+                    "GET",
+                    str(url),
+                    headers=headers,
+                    extensions={
+                        "timeout": {
+                            "connect": 5.0,
+                            "read": _FETCH_TIMEOUT,
+                            "write": 5.0,
+                            "pool": 5.0,
+                        }
+                    },
+                ) as response:
+                    status = response.status
+                    content_type = (
+                        _header_value(response.headers, b"content-type") or b""
+                    ).decode("latin-1")
+                    body = await _read_limited_body(response)
+    except TimeoutError as exc:
+        raise ValueError("抓取超时") from exc
+    text = _decode_body(body, content_type)
+    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return f"HTTP {resp.status_code}\n{text[:2000]}"
+    return f"HTTP {status}\n{text[:2000]}"
 
 
 async def _save_artifact(args: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -379,6 +549,23 @@ async def _save_artifact(args: dict[str, Any], ctx: dict[str, Any]) -> str:
 
 MAX_FILE_BYTES = 200_000
 MAX_WRITE_BYTES = 1_000_000
+
+_SECRET_ENV_NAMES = {
+    "ACCESS_TOKEN", "LLM_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY",
+    "SEARXNG_URL", "CLUSTER_WORKER_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "DATABASE_URL", "REDIS_URL",
+    "MONGO_URL", "DSN",
+}
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+
+
+def _child_env(base=None) -> dict[str, str]:
+    source = os.environ if base is None else base
+    return {
+        key: value for key, value in source.items()
+        if key.upper() not in _SECRET_ENV_NAMES
+        and not key.upper().endswith(_SECRET_ENV_SUFFIXES)
+    }
 
 _DENY_COMMANDS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\brm\s+(-[a-z]+\s+)*-[a-z]*r[a-z]*f[a-z]*\s+/(?:\s|$)", re.I), "递归删除根目录"),
@@ -583,6 +770,7 @@ async def _run_command(args: dict[str, Any], ctx: dict[str, Any]) -> str:
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
+            env=_child_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

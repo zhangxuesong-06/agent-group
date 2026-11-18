@@ -10,10 +10,11 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Annotated, Any, AsyncIterator
 
 from fastapi import (
     FastAPI,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -119,7 +120,6 @@ orchestrator = Orchestrator(
 )
 evaluator = EvaluationRunner(store, llm, settings)
 
-TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "draft"}
 STATIC_DIR = settings.base_dir / "static"
 
@@ -154,7 +154,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         store.close()
 
 
-app = FastAPI(title="AI Cluster MVP", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="AI Cluster MVP",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.enable_api_docs else None,
+    redoc_url="/redoc" if settings.enable_api_docs else None,
+    openapi_url="/openapi.json" if settings.enable_api_docs else None,
+)
+API_DOC_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -280,9 +288,10 @@ def _login_retry_after(key: str) -> float:
 
 @app.middleware("http")
 async def require_auth(request: Request, call_next):
-    """Every /api route requires a login session or the server token."""
+    """Protect API routes and enabled API documentation with the same login."""
     path = request.url.path
-    if request.method == "OPTIONS" or not path.startswith("/api"):
+    is_docs = settings.enable_api_docs and path.rstrip("/") in API_DOC_PATHS
+    if request.method == "OPTIONS" or (not path.startswith("/api") and not is_docs):
         return await call_next(request)
     if path in PUBLIC_API_PATHS:
         return await call_next(request)
@@ -779,8 +788,10 @@ async def delete_device(device_id: str) -> dict:
     record = store.get_device(device_id)
     if record is None:
         raise HTTPException(status_code=404, detail="设备不存在")
-    device_hub.detach(device_id)
+    # Delete first: a worker reconnecting while close() yields must no longer
+    # match the token, or it could stay attached after its device is gone.
     store.delete_device(device_id)
+    await device_hub.detach(device_id, close=True)
     return {"deleted": True}
 
 
@@ -900,6 +911,12 @@ async def browse_device(
     }
 
 
+def _workspace_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()][:32]
+
+
 @app.websocket("/api/worker/ws")
 async def worker_socket(websocket: WebSocket, token: str = Query(default="")) -> None:
     authorization = websocket.headers.get("authorization", "")
@@ -915,12 +932,15 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
     await websocket.accept()
     device_id = record["id"]
     try:
-        hello = await asyncio.wait_for(websocket.receive_json(), timeout=20)
-        workspaces = [
-            str(item).strip()
-            for item in (hello.get("workspaces") or [])
-            if str(item).strip()
-        ][:32]
+        try:
+            hello = await asyncio.wait_for(websocket.receive_json(), timeout=20)
+        except (ValueError, TypeError, KeyError):
+            await websocket.close(code=4401, reason="invalid hello")
+            return
+        if not isinstance(hello, dict):
+            await websocket.close(code=4401, reason="invalid hello")
+            return
+        workspaces = _workspace_list(hello.get("workspaces"))
         platform = str(hello.get("platform") or "")[:120]
         name = str(hello.get("name") or record["name"])[:80]
         store.update_device(
@@ -935,7 +955,14 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
             {"type": "welcome", "device_id": device_id, "name": name}
         )
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await websocket.receive_json()
+            except (ValueError, TypeError, KeyError):
+                # A malformed or binary frame is the worker's bug, not a
+                # reason to drop a connection running approved commands.
+                continue
+            if not isinstance(message, dict):
+                continue
             kind = message.get("type")
             if kind == "result":
                 device_hub.resolve(device_id, message)
@@ -943,11 +970,7 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
                 store.update_device(device_id, last_seen=time.time())
                 await websocket.send_json({"type": "pong"})
             elif kind == "hello":
-                workspaces = [
-                    str(item).strip()
-                    for item in (message.get("workspaces") or [])
-                    if str(item).strip()
-                ][:32]
+                workspaces = _workspace_list(message.get("workspaces"))
                 store.update_device(
                     device_id,
                     name=str(message.get("name") or name)[:80],
@@ -958,7 +981,7 @@ async def worker_socket(websocket: WebSocket, token: str = Query(default="")) ->
     except (WebSocketDisconnect, asyncio.TimeoutError, RuntimeError):
         pass
     finally:
-        device_hub.detach(device_id, websocket)
+        await device_hub.detach(device_id, websocket)
 
 
 def _request_origin(request: Request) -> str:
@@ -1428,11 +1451,23 @@ async def get_artifact(run_id: str, name: str) -> FileResponse:
 
 
 @app.get("/api/runs/{run_id}/events")
-async def stream_events(run_id: str, after: int = Query(default=0, ge=0)) -> StreamingResponse:
+async def stream_events(
+    run_id: str,
+    after: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+) -> StreamingResponse:
     if store.get_run(run_id) is None:
         raise HTTPException(status_code=404, detail="run not found")
-
-    queue = await bus.subscribe(run_id)
+    start = after
+    if last_event_id:
+        try:
+            cursor = int(last_event_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid Last-Event-ID") from None
+        if not 0 <= cursor <= 2**63 - 1:
+            raise HTTPException(status_code=422, detail="invalid Last-Event-ID")
+        # EventSource retains its original query string on automatic reconnect.
+        start = max(start, cursor)
 
     def encode(event: dict) -> str:
         data = json.dumps(event, ensure_ascii=False)
@@ -1443,64 +1478,50 @@ async def stream_events(run_id: str, after: int = Query(default=0, ge=0)) -> Str
         return f"id: {event['seq']}\ndata: {data}\n\n"
 
     async def generator() -> AsyncIterator[str]:
-        last = after
+        queue = await bus.subscribe(run_id)
+        last = start
         try:
-            # A resumed run has historical terminal events in its log. Only
-            # treat them as the end of the stream when the run is terminal
-            # *right now*; otherwise replay the log and continue into live
-            # events after the marker below.
-            current = store.get_run(run_id)
-            terminal_now = bool(
-                current and current["status"] in TERMINAL_STATUSES
-            )
-            for event in store.get_events(run_id, after):
+            for event in store.iter_events(run_id, last):
                 last = event["seq"]
                 yield encode(event)
-                if terminal_now and event["type"] in TERMINAL_EVENTS:
-                    yield "event: end\ndata: {}\n\n"
-                    return
 
-            if not terminal_now:
-                # Send the authoritative state at the history/live boundary.
-                # Events replayed above are log-only, so the client would
-                # otherwise miss anything that happened between its own fetch
-                # and this stream opening.
-                snapshot = store.get_run(run_id)
-                if snapshot is not None:
-                    yield (
-                        "event: snapshot\ndata: "
-                        + json.dumps(snapshot, ensure_ascii=False)
-                        + "\n\n"
-                    )
-                # Everything after this marker is live; the client logs the
-                # replayed history but only applies state changes from here on.
+            snapshot = store.get_run(run_id)
+            if snapshot and snapshot["status"] not in TERMINAL_STATUSES:
+                yield (
+                    "event: snapshot\ndata: "
+                    + json.dumps(snapshot, ensure_ascii=False)
+                    + "\n\n"
+                )
                 yield "event: live\ndata: {}\n\n"
 
-            run = store.get_run(run_id)
-            if run and run["status"] in TERMINAL_STATUSES:
-                yield "event: end\ndata: {}\n\n"
-                return
-
+            durable_pending = True
             while True:
+                if durable_pending:
+                    # The bounded queue is only a wakeup signal: durable
+                    # events come from SQLite, which repairs slow-client gaps.
+                    durable_pending = False
+                    for event in store.iter_events(run_id, last):
+                        last = event["seq"]
+                        yield encode(event)
+                    status = store.get_run_status(run_id)
+                    if status is None or (
+                        status in TERMINAL_STATUSES
+                        and last >= store.last_event_seq(run_id)
+                    ):
+                        yield "event: end\ndata: {}\n\n"
+                        return
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15)
                 except asyncio.TimeoutError:
-                    run = store.get_run(run_id)
-                    if run and run["status"] in TERMINAL_STATUSES:
-                        yield "event: end\ndata: {}\n\n"
-                        return
                     yield ": ping\n\n"
+                    durable_pending = True
                     continue
                 if event.get("transient"):
+                    # Token deltas are memory-only; never re-read history for them.
                     yield encode(event)
                     continue
-                if event["seq"] <= last:
-                    continue
-                last = event["seq"]
-                yield encode(event)
-                if event["type"] in TERMINAL_EVENTS:
-                    yield "event: end\ndata: {}\n\n"
-                    return
+                if event.get("seq", 0) > last:
+                    durable_pending = True
         finally:
             await bus.unsubscribe(run_id, queue)
 

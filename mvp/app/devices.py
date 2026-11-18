@@ -135,17 +135,26 @@ class DeviceHub:
         self._online_event(device_id).set()
         return connection
 
-    def detach(self, device_id: str, websocket: Any | None = None) -> None:
+    async def detach(
+        self, device_id: str, websocket: Any | None = None, *, close: bool = False
+    ) -> None:
         current = self._connections.get(device_id)
         if current is None:
             return
         if websocket is not None and current.websocket is not websocket:
             return
+        # Remove the connection before awaiting close: detach must never yield
+        # while the stale entry is still visible to another attach/call.
         current.cancel_all()
         self._connections.pop(device_id, None)
         event = self._online_events.get(device_id)
         if event is not None:
             event.clear()
+        if close:
+            try:
+                await current.websocket.close(code=4401, reason="device deleted")
+            except Exception:  # noqa: BLE001 - the peer may already be gone
+                pass
 
     def resolve(self, device_id: str, message: dict[str, Any]) -> None:
         current = self._connections.get(device_id)

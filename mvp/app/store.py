@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from .models import Budget, RunState, TaskState, new_id
 
@@ -146,6 +147,19 @@ CREATE TABLE IF NOT EXISTS evaluations (
 CREATE INDEX IF NOT EXISTS idx_evaluations_provider
     ON evaluations(provider_id, created_at DESC);
 """
+
+
+def _json_or(value, default, column: str):
+    if value is None or value == "":
+        return default
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, type(default)):
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    logging.getLogger(__name__).warning("Invalid JSON or type in %s; using default", column)
+    return default
 
 
 class Store:
@@ -304,6 +318,13 @@ class Store:
             )
             self._conn.commit()
 
+    def get_run_status(self, run_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+        return row["status"] if row else None
+
     def get_run(
         self, run_id: str, *, include_checkpoint: bool = False
     ) -> dict[str, Any] | None:
@@ -315,9 +336,8 @@ class Store:
                 "SELECT * FROM tasks WHERE run_id=? ORDER BY ord", (run_id,)
             ).fetchall()
         data = dict(row)
-        data["budget"] = json.loads(data["budget"])
-        data["usage"] = json.loads(data["usage"])
-        data["cluster"] = json.loads(data.get("cluster") or "{}")
+        for key in ("budget", "usage", "cluster"):
+            data[key] = _json_or(data.get(key), {}, f"runs.{key}")
         data["tasks"] = [
             self._task_row(t, include_checkpoint=include_checkpoint)
             for t in tasks
@@ -406,10 +426,7 @@ class Store:
     @staticmethod
     def _message_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
-        try:
-            data["meta"] = json.loads(data.get("meta") or "{}")
-        except json.JSONDecodeError:
-            data["meta"] = {}
+        data["meta"] = _json_or(data.get("meta"), {}, "messages.meta")
         return data
 
     def load_run_state(self, run_id: str) -> RunState | None:
@@ -474,9 +491,8 @@ class Store:
         out = []
         for row in rows:
             item = dict(row)
-            item["budget"] = json.loads(item["budget"])
-            item["usage"] = json.loads(item["usage"])
-            item["cluster"] = json.loads(item.get("cluster") or "{}")
+            for key in ("budget", "usage", "cluster"):
+                item[key] = _json_or(item.get(key), {}, f"runs.{key}")
             item["task_counts"] = by_run.get(item["id"], {})
             out.append(item)
         return out
@@ -842,9 +858,26 @@ class Store:
         out = []
         for row in rows:
             item = dict(row)
-            item["payload"] = json.loads(item["payload"])
+            item["payload"] = _json_or(item["payload"], {}, "events.payload")
             out.append(item)
         return out
+
+    def iter_events(
+        self, run_id: str, after: int = 0, batch: int = 1000
+    ) -> Iterator[dict[str, Any]]:
+        if batch <= 0:
+            raise ValueError("event batch size must be positive")
+        end = self.last_event_seq(run_id)
+        cursor = after
+        while cursor < end:
+            rows = self.get_events(run_id, cursor, batch)
+            if not rows:
+                return
+            for event in rows:
+                if event["seq"] > end:
+                    return
+                cursor = event["seq"]
+                yield event
 
     def last_event_seq(self, run_id: str) -> int:
         with self._lock:
@@ -1168,7 +1201,7 @@ class Store:
             return None
         item = dict(row)
         for key in ("scores", "results", "errors", "usage"):
-            item[key] = json.loads(item[key] or "{}")
+            item[key] = _json_or(item[key], {}, f"evaluations.{key}")
         return item
 
     def list_evaluations(
@@ -1190,7 +1223,7 @@ class Store:
         for row in rows:
             item = dict(row)
             for key in ("scores", "results", "errors", "usage"):
-                item[key] = json.loads(item[key] or "{}")
+                item[key] = _json_or(item[key], {}, f"evaluations.{key}")
             out.append(item)
         return out
 
@@ -1204,11 +1237,11 @@ class Store:
     # ---------- run deletion ----------
 
     def delete_run(self, run_id: str) -> bool:
-        with self._lock:
+        with self._lock, self._conn:
             cur = self._conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
             self._conn.execute("DELETE FROM tasks WHERE run_id=?", (run_id,))
             self._conn.execute("DELETE FROM events WHERE run_id=?", (run_id,))
-            self._conn.commit()
+            self._conn.execute("DELETE FROM messages WHERE run_id=?", (run_id,))
         return cur.rowcount > 0
 
     # ---------- helpers ----------
@@ -1232,16 +1265,9 @@ class Store:
         row: sqlite3.Row, *, include_checkpoint: bool = False
     ) -> dict[str, Any]:
         item = dict(row)
-        item["depends_on"] = json.loads(item["depends_on"])
+        item["depends_on"] = _json_or(item["depends_on"], [], "tasks.depends_on")
         if include_checkpoint:
-            raw = item.get("checkpoint") or ""
-            if raw:
-                try:
-                    item["checkpoint"] = json.loads(raw)
-                except json.JSONDecodeError:
-                    item["checkpoint"] = None
-            else:
-                item["checkpoint"] = None
+            item["checkpoint"] = _json_or(item.get("checkpoint"), {}, "tasks.checkpoint") or None
         else:
             item.pop("checkpoint", None)
         return item

@@ -1,6 +1,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.28
+httpcore>=1.0
 pydantic>=2.7
 python-dotenv>=1.0
 mcp>=2.0

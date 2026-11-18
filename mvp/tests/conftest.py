@@ -25,17 +25,25 @@ from mvp.app.main import app
 
 
 @pytest.fixture(scope="session")
-def client():
+def app_lifespan():
     with TestClient(app) as test_client:
         yield test_client
 
 
-@pytest.fixture(scope="session")
-def auth_client():
-    with TestClient(app) as test_client:
-        response = test_client.post("/api/auth/login", json={"token": "test-token"})
-        assert response.status_code == 200
-        yield test_client
+@pytest.fixture()
+def client(app_lifespan):
+    app_lifespan.cookies.clear()
+    try:
+        yield app_lifespan
+    finally:
+        app_lifespan.cookies.clear()
+
+
+@pytest.fixture()
+def auth_client(client):
+    response = client.post("/api/auth/login", json={"token": "test-token"})
+    assert response.status_code == 200
+    return client
 
 
 @pytest.fixture()
@@ -56,4 +64,8 @@ def orchestrator():
 def store(tmp_path):
     from mvp.app.store import Store
 
-    return Store(str(tmp_path / "test.db"))
+    instance = Store(str(tmp_path / "test.db"))
+    try:
+        yield instance
+    finally:
+        instance.close()

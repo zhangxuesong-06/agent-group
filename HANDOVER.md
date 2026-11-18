@@ -611,6 +611,9 @@ POST /api/auth/login {token}
 - 改 `ACCESS_TOKEN` 只阻止新登录，**不会**让已有会话失效；泄露时还要撤销会话
 - 登录限速在内存，重启清零；`X-Forwarded-For` 可伪造（仅影响限速）
 - 局域网 HTTP 下 cookie 没有 Secure，是明文
+- API 文档默认关闭；`ENABLE_API_DOCS=1` 后 `/docs`、`/redoc`、`/openapi.json` 仍需登录
+- 本地与 worker 命令子进程不继承 `ACCESS_TOKEN`、`*_API_KEY`、`*_TOKEN`、`*_SECRET`、`*_PASSWORD`、`*_CREDENTIALS`、常见数据库 URL 和代理变量；这是按名单剔除，不是完整沙箱
+- `fetch_url` 只访问解析到公网单播地址的 HTTP(S)，连接钉住已验证 IP，正文上限 1 MiB，不跟随重定向；它**不使用**环境代理（代理会绕过地址校验），需要代理时在出口网关做同等限制
 - `web_search`、MCP、模型调用在服务器端，不走设备 token
 
 ---
@@ -766,6 +769,7 @@ shell.run{workspace, command, cwd?, timeout<=600}
 | `DATA_DIR` | `mvp/data` | SQLite、产物、工作区 |
 | `WORKSPACE_DIR` | `DATA_DIR/workspace` | 服务器本机工作区 |
 | `ACCESS_TOKEN` | 自动生成 | 首次登录令牌 |
+| `ENABLE_API_DOCS` | `0` | 设为 1 才开放 `/docs`、`/redoc`、`/openapi.json`（仍需登录） |
 | `SESSION_DAYS` | `180` | 会话有效期 |
 | `CORS_ORIGINS` | `*` | CORS |
 | `LLM_BASE_URL` | 空 | OpenAI 兼容地址；为空则 mock |
@@ -896,17 +900,18 @@ mock 模式下应输出 `{"ok": true, ...}`。
 11. 运行中重启服务器 → 启动恢复，已完成任务不重跑
 12. 刷新页面 → 会话保持；退出登录 → 回到登录页
 
-### 15.4 建议补的自动化测试
+### 15.4 自动化测试
 
-目前没有 pytest 套件。建议：
+已有 pytest 回归网，入口：
 
-- `pytest` + `fastapi.testclient.TestClient`
-- 认证：401 / 登录 / cookie / CSRF / 限流 / 撤销
-- 设备：browse 包含关系、越界、离线 409
-- 运行：mock 模式全流程、checkpoint 恢复
-- 存储：会话过期、事件回放
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r mvp\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+```
 
-测试时要显式设置 `ACCESS_TOKEN`，否则 `config` 首次导入会生成 `mvp/.env`（见 16.13）。
+覆盖：登录/CSRF/限流/撤销、空与异常 `ACCESS_TOKEN`、API 文档鉴权、子进程环境隔离、SSE 分页与重连、JSON 列容错、运行删除级联、设备断连与非法 WS 帧、`fetch_url` 地址与大小限制。测试通过 `conftest.py` 在导入应用前设置临时 `DATA_DIR` 和 `ACCESS_TOKEN`，不会写真实库；跑完可对比 `mvp/.env` 与 `mvp/data` 的哈希确认。
+
+尚未覆盖：不需要真实 LLM 的编排取消/调度锁（M2）、前端交互（M3）。
 
 ---
 
@@ -931,13 +936,17 @@ mock 模式下应输出 `{"ok": true, ...}`。
 17. **真实库 `devices=0`**：远程链路需要先配对一台设备才能验收。
 18. **`scope=run` 审批授权释放不彻底**：运行结束后仍留在内存，删除运行或重启才清理；影响很小，可在 `_finish` 里加 `forget_run`。
 
-> **2026-11-17 补充审计**：另发现 P0 × 1、P1 × 17、P2 × 约 47 条尚未记录的问题，详见 `docs/2026-11-17-审计报告.md`。其中 SEC-01/02/03（空/异常 `ACCESS_TOKEN` 绕过鉴权与非 ASCII 500）已于 2026-11-17 修复，并新增 `mvp/tests` pytest 回归（40 passed）；M0 测试地基已完成。其余 P1/P2 按 `docs/superpowers/plans/2026-11-17-quality-hardening.md` 的 M1 继续。
+> **2026-11-17 补充审计**：另发现 P0 × 1、P1 × 17、P2 × 约 47 条尚未记录的问题，详见 `docs/2026-11-17-审计报告.md`。
+>
+> **已完成（M0 + M1）**：SEC-01/02/03（空/异常 `ACCESS_TOKEN` 绕过与 Unicode 500）、SEC-04（文档端点默认关闭且开启后需登录）、SEC-07（子进程环境变量剔除）、SEC-08（`fetch_url` SSRF、DNS rebinding、重定向与响应上限）、DATA-01（删除运行级联 messages）、DATA-02（JSON 列容错）、DATA-03（SSE 分页回放与 `Last-Event-ID`）、DATA-04/05（设备删除断连与 worker 非法帧容错）。回归见 `mvp/tests`，当前 147 passed；跑测试前后 `mvp/.env` 与 `mvp/data` 哈希不变。
+>
+> **下一步**：`docs/superpowers/plans/2026-11-17-quality-hardening.md` 的 Task 9–12（M2 调度/取消/checkpoint），随后 M3 前端与 M4 可见性。
 
 ---
 
 ## 17. 路线图
 
-建议顺序：**质量硬化 M0–M1（见上）→ P1 → P2 → P3 → P4 → P5**。质量硬化会先补 pytest 地基和鉴权/数据正确性，避免后续功能验收反复返工。
+建议顺序：**质量硬化 M0–M1（已完成）→ M2 运行/调度 → M3 前端状态 → M4 P1 可见性 → P2 → P3 → P4 → P5**。先补 pytest 地基和鉴权/数据正确性，避免后续功能验收反复返工。
 
 ### P1 可信回溯（优先）
 

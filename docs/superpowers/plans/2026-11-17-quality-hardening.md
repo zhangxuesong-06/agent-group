@@ -1,5 +1,7 @@
 # 质量硬化实施计划（M0–M1）
 
+> 进度（2026-11-17）：M0 与 M1 已完成。Task 1–8、SEC-08（原计划遗漏）已实施并有回归测试，`pytest -q` 147 passed；Task 9–12（M2 调度/取消/checkpoint）尚未开始。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > 本文件覆盖 **M0 测试地基** 与 **M1 安全/数据正确性**，按 TDD 逐步写。M2–M4 在本文件末尾以任务卡形式列出，M1 验收后再展开成同粒度的步骤。

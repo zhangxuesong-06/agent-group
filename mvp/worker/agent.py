@@ -17,6 +17,24 @@ MAX_FILE_BYTES = 200_000
 MAX_WRITE_BYTES = 1_000_000
 MAX_OUTPUT = 200_000
 
+# This worker is also distributed standalone; keep its policy in sync with app.tools.
+_SECRET_ENV_NAMES = {
+    "ACCESS_TOKEN", "LLM_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY",
+    "SEARXNG_URL", "CLUSTER_WORKER_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "DATABASE_URL", "REDIS_URL",
+    "MONGO_URL", "DSN",
+}
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+
+
+def _child_env(base=None) -> dict[str, str]:
+    source = os.environ if base is None else base
+    return {
+        key: value for key, value in source.items()
+        if key.upper() not in _SECRET_ENV_NAMES
+        and not key.upper().endswith(_SECRET_ENV_SUFFIXES)
+    }
+
 DENY = (
     "rm -rf /",
     "mkfs",
@@ -220,6 +238,7 @@ class Worker:
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
+            env=_child_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
